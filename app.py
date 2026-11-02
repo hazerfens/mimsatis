@@ -1,17 +1,16 @@
-# 1. Gerekli Kütüphanelerin Yüklenmesi
-
+# =============================================================================
+# MİM REKLAM SATIŞ SİSTEMİ - GÜNCEL PROD SÜRÜM
+# =============================================================================
 import os
 import json
 import time
 import smtplib
-import urllib.request
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email import encoders
-from datetime import datetime
-from threading import Thread
-from flask import Flask, render_template_string, request, redirect, url_for, send_file, flash, session, send_from_directory, Response
+from datetime import datetime, timedelta
+from flask import Flask, render_template_string, request, redirect, url_for, send_file, flash, session, send_from_directory, Response, jsonify
 from flask_sqlalchemy import SQLAlchemy
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
@@ -35,7 +34,11 @@ class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     username = db.Column(db.String(50), unique=True, nullable=False)
     full_name = db.Column(db.String(100), nullable=False)
+    title = db.Column(db.String(100), default='Satış Temsilcisi')
     email = db.Column(db.String(120), nullable=True)
+    email_pass = db.Column(db.String(100), nullable=True) # Personele özel e-posta şifresi
+    email_signature = db.Column(db.Text, nullable=True)   # Otomatik mail imzası
+    allowed_menus = db.Column(db.Text, default='customers,tasks,dashboard,bulk_email') # İzin verilen menüler JSON
     password_hash = db.Column(db.String(200), nullable=False)
     role = db.Column(db.String(20), default='Personel')
 
@@ -56,16 +59,17 @@ class SystemSetting(db.Model):
 
 class Customer(db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    company_name = db.Column(db.String(200), nullable=False)
-    contact_person = db.Column(db.String(100), nullable=False)
-    email = db.Column(db.String(120), nullable=False)
-    phone = db.Column(db.String(50), nullable=False)
+    trade_registry_no = db.Column(db.String(100), nullable=True) # Ticaret Sicil No
+    company_name = db.Column(db.String(200), nullable=False)      # Unvan
+    contact_person = db.Column(db.String(100), nullable=True)     # Yetkili
+    email = db.Column(db.String(120), nullable=False)             # Firma Mail
+    phone = db.Column(db.String(50), nullable=False)              # Firma Tel
+    address = db.Column(db.Text, nullable=True)                   # Adres
     category = db.Column(db.String(50), default='Genel')
     assigned_sales_rep = db.Column(db.String(100), default='Çiğdem Biçer')
-    tax_office = db.Column(db.String(100))
-    tax_number = db.Column(db.String(50))
-    address = db.Column(db.Text)
-    payment_terms = db.Column(db.String(100))
+    tax_office = db.Column(db.String(100), nullable=True)
+    tax_number = db.Column(db.String(50), nullable=True)
+    payment_terms = db.Column(db.String(100), nullable=True)
     credit_limit = db.Column(db.Float, default=0.0)
     current_balance = db.Column(db.Float, default=0.0)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
@@ -103,6 +107,7 @@ class Interaction(db.Model):
     customer_id = db.Column(db.Integer, db.ForeignKey('customer.id'), nullable=False)
     sales_rep = db.Column(db.String(100), nullable=False)
     interaction_date = db.Column(db.DateTime, default=datetime.utcnow)
+    planned_datetime = db.Column(db.DateTime, nullable=True) # İleri tarihli randevu (Tarih + Saat)
     location = db.Column(db.String(100))
     customer_feedback = db.Column(db.Text)
     notes = db.Column(db.Text)
@@ -134,43 +139,47 @@ class ProductionIssue(db.Model):
     status = db.Column(db.String(50), default='Devam Ediyor')
 
 # -----------------------------------------------------------------------------
-# PWA & E-POSTA MOTORU
+# PERSONELE ÖZEL E-POSTA & İMZA MOTORU
 # -----------------------------------------------------------------------------
 
-@app.route('/manifest.json')
-def pwa_manifest():
-    manifest_data = {
-        "name": "MİM REKLAM Satış Sistemi",
-        "short_name": "Mim Satış",
-        "start_url": "/",
-        "display": "standalone",
-        "background_color": "#36082a",
-        "theme_color": "#701658",
-        "icons": [{"src": "/uploads/logo.png", "sizes": "192x192", "type": "image/png"}]
-    }
-    return Response(json.dumps(manifest_data), mimetype='application/json')
+def send_custom_mail(sender_user_id, to_email, subject, body_html, attachment_filepath=None, cc_emails=None):
+    # Gönderen personelin mail bilgilerini kontrol et, yoksa genel ayarları kullan
+    sender = User.query.get(sender_user_id)
+    mail_user = None
+    mail_pass = None
+    signature = ""
 
-@app.route('/sw.js')
-def service_worker():
-    return Response("self.addEventListener('fetch', (e) => {});", mimetype='application/javascript')
+    if sender and sender.email and sender.email_pass:
+        mail_user = sender.email.strip()
+        mail_pass = sender.email_pass.strip().replace(" ", "")
+        if sender.email_signature:
+            signature = f"<br><br><div style='border-top:1px solid #ccc; padding-top:10px; color:#555;'>{sender.email_signature}</div>"
+    else:
+        sys_user = SystemSetting.query.filter_by(key='GMAIL_USER').first()
+        sys_pass = SystemSetting.query.filter_by(key='GMAIL_APP_PASS').first()
+        if sys_user and sys_pass and sys_user.value and sys_pass.value:
+            mail_user = sys_user.value.strip()
+            mail_pass = sys_pass.value.strip().replace(" ", "")
 
-def send_gmail_with_attachment(to_email, subject, body_html, attachment_filepath=None, cc_emails=None):
-    gmail_user = SystemSetting.query.filter_by(key='GMAIL_USER').first()
-    gmail_pass = SystemSetting.query.filter_by(key='GMAIL_APP_PASS').first()
-    if not gmail_user or not gmail_pass or not gmail_user.value or not gmail_pass.value:
-        return False, "Sistem Ayarlarından Gmail ve 16 haneli Uygulama Şifresi girilmemiş!"
+    if not mail_user or not mail_pass:
+        return False, "E-posta gönderici adresi veya şifresi tanımlanmamış!"
+
     try:
         msg = MIMEMultipart()
-        msg['From'] = gmail_user.value.strip()
+        msg['From'] = mail_user
         msg['To'] = to_email.strip()
         msg['Subject'] = subject
+
         recipients = [to_email.strip()]
         if cc_emails:
             clean_ccs = [c.strip() for c in cc_emails.replace(';', ',').split(',') if c.strip() and '@' in c]
             if clean_ccs:
                 msg['Cc'] = ", ".join(clean_ccs)
                 recipients.extend(clean_ccs)
-        msg.attach(MIMEText(body_html, 'html'))
+
+        full_body = body_html + signature
+        msg.attach(MIMEText(full_body, 'html'))
+
         if attachment_filepath and os.path.exists(attachment_filepath):
             filename = os.path.basename(attachment_filepath)
             with open(attachment_filepath, "rb") as f:
@@ -179,16 +188,17 @@ def send_gmail_with_attachment(to_email, subject, body_html, attachment_filepath
             encoders.encode_base64(part)
             part.add_header("Content-Disposition", f"attachment; filename= {filename}")
             msg.attach(part)
+
         server = smtplib.SMTP_SSL('smtp.gmail.com', 465, timeout=10)
-        server.login(gmail_user.value.strip(), gmail_pass.value.strip().replace(" ", ""))
-        server.sendmail(gmail_user.value.strip(), recipients, msg.as_string())
+        server.login(mail_user, mail_pass)
+        server.sendmail(mail_user, recipients, msg.as_string())
         server.quit()
         return True, "Başarılı"
     except Exception as e:
         return False, str(e)
 
 # -----------------------------------------------------------------------------
-# ARAYÜZ (HTML)
+# ARAYÜZ TEMPLATELERİ (MİM REKLAM MOR RENGİ: #701658)
 # -----------------------------------------------------------------------------
 
 BASE_HTML = """
@@ -198,12 +208,10 @@ BASE_HTML = """
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>MİM REKLAM SATIŞ SİSTEMİ</title>
-    <link rel="manifest" href="/manifest.json">
-    <meta name="theme-color" content="#701658">
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <style>
-        :root { --mim-purple: #701658; --mim-purple-hover: #540f42; }
+        :root { --mim-purple: #701658; --mim-purple-hover: #540f42; --mim-purple-light: #fbeff7; }
         body { background:#f9f5f8; font-family:'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
         .sidebar { min-height:100vh; background:#36082a; color:white; }
         .sidebar .nav-link { color:#e8d1e2; margin:4px 0; border-radius:6px; font-weight:500; }
@@ -214,30 +222,52 @@ BASE_HTML = """
         .btn-outline-mim:hover { background-color: var(--mim-purple); color: white; }
         .card-custom { border:none; border-radius:10px; box-shadow:0 4px 8px rgba(112, 22, 88, 0.08); }
         .text-mim { color: var(--mim-purple) !important; }
+        .bg-mim { background-color: var(--mim-purple) !important; color: white !important; }
         .badge-mim { background-color: var(--mim-purple); color: white; }
         .nav-tabs .nav-link.active { border-bottom: 3px solid var(--mim-purple); color: var(--mim-purple) !important; font-weight: bold; }
-        @media (max-width: 768px) { .sidebar { min-height: auto; } }
+        #meetingAlertBox { position: fixed; top: 20px; right: 20px; z-index: 9999; max-width: 380px; display: none; }
     </style>
 </head>
 <body>
+<!-- Canlı Görüşme Uyarısı (Yarım Saat Önceden Bildirim) -->
+<div id="meetingAlertBox" class="alert alert-danger shadow-lg border-start border-danger border-5 alert-dismissible fade show">
+    <div class="d-flex align-items-center">
+        <i class="fa-solid fa-bell fa-shake fa-2x text-danger me-3"></i>
+        <div>
+            <h6 class="fw-bold mb-1 text-danger">YAKLAŞAN GÖRÜŞME HATIRLATMASI!</h6>
+            <div id="meetingAlertText" class="small"></div>
+        </div>
+    </div>
+    <button type="button" class="btn-close" onclick="document.getElementById('meetingAlertBox').style.display='none'"></button>
+</div>
+
 <div class="container-fluid"><div class="row">
     {% if session.get('user_id') %}
     <div class="col-md-2 sidebar p-3">
-        <div class="text-center mb-4 pb-2 border-bottom border-secondary">
+        <div class="text-center mb-3 pb-2 border-bottom border-secondary">
             <h5 class="fw-bold text-white mb-1"><i class="fa-solid fa-shapes text-warning me-2"></i>MİM REKLAM</h5>
             <small class="text-light" style="font-size:0.75rem; letter-spacing:1px;">SATIŞ SİSTEMİ</small>
         </div>
         <div class="mb-3 p-2 rounded text-white small" style="background:#540f42;">
             <i class="fa-solid fa-user-circle me-1"></i> <strong>{{ session.get('full_name') }}</strong><br>
-            <span class="badge bg-warning text-dark mt-1">{{ session.get('role') }}</span>
+            <span class="badge bg-warning text-dark mt-1">{{ session.get('title') or session.get('role') }}</span>
         </div>
         <ul class="nav flex-column">
+            {% set allowed = session.get('allowed_menus', '') %}
+            {% if 'customers' in allowed or session.get('role') == 'Admin' %}
             <li class="nav-item"><a href="/" class="nav-link text-white"><i class="fa-solid fa-users me-2"></i>Müşteriler</a></li>
+            {% endif %}
+            {% if 'tasks' in allowed or session.get('role') == 'Admin' %}
             <li class="nav-item"><a href="/tasks" class="nav-link text-white"><i class="fa-solid fa-list-check me-2"></i>Görevler Paneli</a></li>
+            {% endif %}
+            {% if 'dashboard' in allowed or session.get('role') == 'Admin' %}
             <li class="nav-item"><a href="/dashboard" class="nav-link text-white"><i class="fa-solid fa-chart-pie me-2"></i>Yönetici Raporu</a></li>
-            <li class="nav-item"><a href="/bulk-email" class="nav-link text-white"><i class="fa-solid fa-paper-plane me-2"></i>Gmail Toplu Mail</a></li>
+            {% endif %}
+            {% if 'bulk_email' in allowed or session.get('role') == 'Admin' %}
+            <li class="nav-item"><a href="/bulk-email" class="nav-link text-white"><i class="fa-solid fa-paper-plane me-2"></i>Toplu Mail</a></li>
+            {% endif %}
             {% if session.get('role') == 'Admin' %}
-            <li class="nav-item"><a href="/settings" class="nav-link text-white"><i class="fa-solid fa-gears me-2"></i>Ayarlar</a></li>
+            <li class="nav-item"><a href="/settings" class="nav-link text-white"><i class="fa-solid fa-gears me-2"></i>Ayarlar & Yetkiler</a></li>
             {% endif %}
             <li class="nav-item mt-4"><a href="/logout" class="nav-link text-danger"><i class="fa-solid fa-right-from-bracket me-2"></i>Çıkış Yap</a></li>
         </ul>
@@ -252,7 +282,25 @@ BASE_HTML = """
         {% block content %}{% endblock %}
     </div>
 </div></div>
+
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+<!-- 30 Dakika Önceden Randevu Kontrol Scripti -->
+<script>
+function checkUpcomingMeetings() {
+    fetch('/api/upcoming-meetings')
+    .then(r => r.json())
+    .then(data => {
+        if(data && data.length > 0) {
+            let msg = data.map(m => `<b>${m.customer_name}</b> ile görüşmenize <b>${m.minutes_left} dk</b> kaldı! (${m.time})`).join('<br>');
+            document.getElementById('meetingAlertText').innerHTML = msg;
+            document.getElementById('meetingAlertBox').style.display = 'block';
+        }
+    })
+    .catch(e => console.log('Randevu kontrol hatası:', e));
+}
+setInterval(checkUpcomingMeetings, 60000);
+document.addEventListener('DOMContentLoaded', checkUpcomingMeetings);
+</script>
 </body>
 </html>
 """
@@ -261,12 +309,12 @@ LOGIN_HTML = BASE_HTML.replace('{% block content %}{% endblock %}', """
 <div class="row justify-content-center mt-5"><div class="col-md-4"><div class="card card-custom p-4 text-center">
     <div class="mb-3">
         <h3 class="fw-bold text-mim mb-0"><i class="fa-solid fa-shapes me-2"></i>MİM REKLAM</h3>
-        <p class="text-muted small fw-bold">SATIŞ SİSTEMİ</p>
+        <p class="text-muted small fw-bold">SATIŞ SİSTEMİ GİRİŞİ</p>
     </div>
     <form method="POST" action="/login" class="text-start">
-        <div class="mb-3"><label class="form-label fw-bold">Kullanıcı Adı</label><input type="text" name="username" class="form-control" required placeholder="admin"></div>
-        <div class="mb-3"><label class="form-label fw-bold">Şifre</label><input type="password" name="password" class="form-control" required placeholder="123456"></div>
-        <button type="submit" class="btn btn-mim w-100 py-2 fw-bold">Sisteme Giriş Yap</button>
+        <div class="mb-3"><label class="form-label fw-bold">Kullanıcı Adı</label><input type="text" name="username" class="form-control" required placeholder="Kullanıcı adınız"></div>
+        <div class="mb-3"><label class="form-label fw-bold">Şifre</label><input type="password" name="password" class="form-control" required placeholder="******"></div>
+        <button type="submit" class="btn btn-mim w-100 py-2 fw-bold">Giriş Yap</button>
     </form>
 </div></div></div>
 """)
@@ -275,102 +323,114 @@ INDEX_HTML = BASE_HTML.replace('{% block content %}{% endblock %}', """
 <div class="d-flex justify-content-between align-items-center mb-4 flex-wrap gap-2">
     <h2><i class="fa-solid fa-address-book text-mim me-2"></i>Müşteri Portföyü</h2>
     <div>
-        <a href="/download-template" class="btn btn-outline-secondary btn-sm me-1"><i class="fa-solid fa-download me-1"></i>Excel Şablonu</a>
-        <button class="btn btn-outline-success btn-sm me-1" data-bs-toggle="modal" data-bs-target="#importExcelModal"><i class="fa-solid fa-file-excel me-1"></i>Excel Yükle</button>
-        <button class="btn btn-mim btn-sm" data-bs-toggle="modal" data-bs-target="#newCustomerModal"><i class="fa-solid fa-plus me-1"></i>Müşteri Ekle</button>
+        <a href="/download-template" class="btn btn-outline-secondary btn-sm me-1"><i class="fa-solid fa-download me-1"></i>Excel Şablonu İndir</a>
+        <button class="btn btn-outline-success btn-sm me-1" data-bs-toggle="modal" data-bs-target="#importExcelModal"><i class="fa-solid fa-file-excel me-1"></i>Excel ile Toplu Yükle</button>
+        <button class="btn btn-mim btn-sm" data-bs-toggle="modal" data-bs-target="#newCustomerModal"><i class="fa-solid fa-plus me-1"></i>Yeni Müşteri Ekle</button>
     </div>
 </div>
 
 <div class="card card-custom p-3 mb-4 bg-white">
     <form method="GET" action="/" class="row g-2 align-items-end">
-        <div class="col-md-5"><input type="text" name="search" class="form-control" placeholder="Müşteri Adı / Yetkili / Vergi No..." value="{{ search_query }}"></div>
+        <div class="col-md-5"><input type="text" name="search" class="form-control" placeholder="Unvan, Yetkili, Sicil No veya Tel ile Ara..." value="{{ search_query }}"></div>
         <div class="col-md-3">
             <select name="category" class="form-select">
                 <option value="ALL">Tüm Kategoriler</option>
                 {% for cat in categories %}<option value="{{ cat.name }}" {% if filter_cat == cat.name %}selected{% endif %}>{{ cat.name }}</option>{% endfor %}
             </select>
         </div>
-        <div class="col-md-2"><button type="submit" class="btn btn-mim w-100"><i class="fa-solid fa-magnifying-glass me-1"></i>Ara</button></div>
+        <div class="col-md-2"><button type="submit" class="btn btn-mim w-100"><i class="fa-solid fa-magnifying-glass me-1"></i>Filtrele</button></div>
         <div class="col-md-2"><a href="/" class="btn btn-outline-secondary w-100">Sıfırla</a></div>
     </form>
 </div>
 
 <div class="card card-custom p-3 table-responsive">
     <table class="table table-hover align-middle">
-        <thead class="table-light"><tr><th>Firma Unvanı</th><th>Yetkili</th><th>İletişim</th><th>Temsilci</th><th>Cari Bakiye</th><th>Kategori</th><th class="text-end">İşlemler</th></tr></thead>
+        <thead class="table-light">
+            <tr>
+                <th>Unvan (Firma Adı)</th>
+                <th>Ticaret Sicil No</th>
+                <th>Firma Tel / Mail</th>
+                <th>Temsilci</th>
+                <th>Cari Bakiye</th>
+                <th>Kategori</th>
+                <th class="text-end">İşlemler</th>
+            </tr>
+        </thead>
         <tbody>
             {% for c in customers %}
             <tr>
-                <td class="fw-bold text-mim">{{ c.company_name }}</td>
-                <td>{{ c.contact_person }}</td>
-                <td><small>{{ c.email }}<br>{{ c.phone }}</small></td>
+                <td class="fw-bold text-mim">{{ c.company_name }}<br><small class="text-muted">{{ c.contact_person or '' }}</small></td>
+                <td>{{ c.trade_registry_no or '-' }}</td>
+                <td><small>{{ c.phone }}<br>{{ c.email }}</small></td>
                 <td><span class="badge bg-secondary">{{ c.assigned_sales_rep }}</span></td>
                 <td class="fw-bold">{{ "{:,.2f}".format(c.current_balance) }} ₺</td>
                 <td><span class="badge badge-mim">{{ c.category }}</span></td>
                 <td class="text-end">
                     <a href="/customer/{{ c.id }}" class="btn btn-sm btn-outline-mim"><i class="fa-solid fa-eye me-1"></i>Kartı Aç</a>
                     <button class="btn btn-sm btn-outline-warning" data-bs-toggle="modal" data-bs-target="#editCustModal{{ c.id }}"><i class="fa-solid fa-pen"></i></button>
-                    <a href="/customer/delete/{{ c.id }}" class="btn btn-sm btn-outline-danger" onclick="return confirm('Silmek istiyor musunuz?');"><i class="fa-solid fa-trash"></i></a>
+                    <a href="/customer/delete/{{ c.id }}" class="btn btn-sm btn-outline-danger" onclick="return confirm('Müşteriyi ve bağlı kayıtları silmek istediğinize emin misiniz?');"><i class="fa-solid fa-trash"></i></a>
                 </td>
             </tr>
 
+            <!-- Müşteri Düzenle Modal -->
             <div class="modal fade" id="editCustModal{{ c.id }}" tabindex="-1"><div class="modal-dialog modal-lg"><div class="modal-content">
                 <form method="POST" action="/customer/edit/{{ c.id }}">
-                    <div class="modal-header"><h5 class="modal-title text-mim fw-bold">Müşteri Kartını Düzenle</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
+                    <div class="modal-header"><h5 class="modal-title text-mim fw-bold">Müşteri Bilgilerini Düzenle</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
                     <div class="modal-body row g-3">
-                      <div class="col-md-6"><label class="form-label fw-bold">Firma Unvanı *</label><input type="text" name="company_name" class="form-control" value="{{ c.company_name }}" required></div>
-                      <div class="col-md-6"><label class="form-label fw-bold">Yetkili Ad Soyad *</label><input type="text" name="contact_person" class="form-control" value="{{ c.contact_person }}" required></div>
-                      <div class="col-md-6"><label class="form-label fw-bold">E-Posta *</label><input type="email" name="email" class="form-control" value="{{ c.email }}" required></div>
-                      <div class="col-md-6"><label class="form-label fw-bold">Telefon *</label><input type="text" name="phone" class="form-control" value="{{ c.phone }}" required></div>
+                      <div class="col-md-6"><label class="form-label fw-bold">Unvan (Firma Adı) *</label><input type="text" name="company_name" class="form-control" value="{{ c.company_name }}" required></div>
+                      <div class="col-md-6"><label class="form-label fw-bold">Ticaret Sicil No</label><input type="text" name="trade_registry_no" class="form-control" value="{{ c.trade_registry_no or '' }}"></div>
+                      <div class="col-md-6"><label class="form-label fw-bold">Firma Mail *</label><input type="email" name="email" class="form-control" value="{{ c.email }}" required></div>
+                      <div class="col-md-6"><label class="form-label fw-bold">Firma Tel *</label><input type="text" name="phone" class="form-control" value="{{ c.phone }}" required></div>
+                      <div class="col-md-6"><label class="form-label">Yetkili Ad Soyad</label><input type="text" name="contact_person" class="form-control" value="{{ c.contact_person or '' }}"></div>
+                      <div class="col-md-6"><label class="form-label">Kategori</label>
+                        <select name="category" class="form-select">{% for cat in categories %}<option value="{{ cat.name }}" {% if c.category == cat.name %}selected{% endif %}>{{ cat.name }}</option>{% endfor %}</select>
+                      </div>
                       <div class="col-md-4"><label class="form-label">Vergi Dairesi</label><input type="text" name="tax_office" class="form-control" value="{{ c.tax_office or '' }}"></div>
                       <div class="col-md-4"><label class="form-label">Vergi No</label><input type="text" name="tax_number" class="form-control" value="{{ c.tax_number or '' }}"></div>
                       <div class="col-md-4"><label class="form-label">Ödeme Vadesi</label><input type="text" name="payment_terms" class="form-control" value="{{ c.payment_terms or '' }}"></div>
-                      <div class="col-md-4"><label class="form-label">Kredi Limiti</label><input type="number" step="0.01" name="credit_limit" class="form-control" value="{{ c.credit_limit }}"></div>
-                      <div class="col-md-4"><label class="form-label">Kategori</label>
-                        <select name="category" class="form-select">{% for cat in categories %}<option value="{{ cat.name }}" {% if c.category == cat.name %}selected{% endif %}>{{ cat.name }}</option>{% endfor %}</select>
-                      </div>
-                      <div class="col-md-4"><label class="form-label">Satıcı</label>
-                        <select name="assigned_sales_rep" class="form-select">{% for u in users %}<option value="{{ u.full_name }}" {% if c.assigned_sales_rep == u.full_name %}selected{% endif %}>{{ u.full_name }}</option>{% endfor %}</select>
-                      </div>
-                      <div class="col-md-12"><label class="form-label">Adres</label><textarea name="address" class="form-control" rows="2">{{ c.address or '' }}</textarea></div>
+                      <div class="col-md-12"><label class="form-label">Adres *</label><textarea name="address" class="form-control" rows="2">{{ c.address or '' }}</textarea></div>
                     </div>
                     <div class="modal-footer"><button type="submit" class="btn btn-mim">Güncelle</button></div>
                 </form>
             </div></div></div>
-            {% else %}<tr><td colspan="7" class="text-center py-4 text-muted">Kayıt bulunamadı.</td></tr>{% endfor %}
+            {% else %}
+            <tr><td colspan="7" class="text-center py-4 text-muted">Aramanıza uygun müşteri kaydı bulunamadı.</td></tr>
+            {% endfor %}
         </tbody>
     </table>
 </div>
 
+<!-- Yeni Müşteri Modal -->
 <div class="modal fade" id="newCustomerModal" tabindex="-1"><div class="modal-dialog modal-lg"><div class="modal-content">
     <form method="POST" action="/customer/add">
         <div class="modal-header"><h5 class="modal-title text-mim fw-bold">Yeni Müşteri Ekle</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
         <div class="modal-body row g-3">
-          <div class="col-md-6"><label class="form-label fw-bold">Firma Unvanı *</label><input type="text" name="company_name" class="form-control" required></div>
-          <div class="col-md-6"><label class="form-label fw-bold">Yetkili *</label><input type="text" name="contact_person" class="form-control" required></div>
-          <div class="col-md-6"><label class="form-label fw-bold">E-Posta *</label><input type="email" name="email" class="form-control" required></div>
-          <div class="col-md-6"><label class="form-label fw-bold">Telefon *</label><input type="text" name="phone" class="form-control" required></div>
-          <div class="col-md-4"><label class="form-label">Vergi Dairesi</label><input type="text" name="tax_office" class="form-control"></div>
-          <div class="col-md-4"><label class="form-label">Vergi No</label><input type="text" name="tax_number" class="form-control"></div>
-          <div class="col-md-4"><label class="form-label">Ödeme Vadesi</label><input type="text" name="payment_terms" class="form-control"></div>
-          <div class="col-md-4"><label class="form-label">Kredi Limiti</label><input type="number" step="0.01" name="credit_limit" class="form-control" value="0.00"></div>
-          <div class="col-md-4"><label class="form-label">Kategori</label>
+          <div class="col-md-6"><label class="form-label fw-bold text-danger">Unvan (Firma Adı) *</label><input type="text" name="company_name" class="form-control" required placeholder="Örn: ABC Reklam Ltd."></div>
+          <div class="col-md-6"><label class="form-label fw-bold">Ticaret Sicil No</label><input type="text" name="trade_registry_no" class="form-control" placeholder="Örn: 123456"></div>
+          <div class="col-md-6"><label class="form-label fw-bold text-danger">Firma Mail *</label><input type="email" name="email" class="form-control" required placeholder="info@firma.com"></div>
+          <div class="col-md-6"><label class="form-label fw-bold text-danger">Firma Tel *</label><input type="text" name="phone" class="form-control" required placeholder="05XXXXXXXXX"></div>
+          <div class="col-md-6"><label class="form-label">Yetkili Ad Soyad</label><input type="text" name="contact_person" class="form-control" placeholder="Yetkili Kişi"></div>
+          <div class="col-md-6"><label class="form-label">Kategori</label>
             <select name="category" class="form-select">{% for cat in categories %}<option value="{{ cat.name }}">{{ cat.name }}</option>{% endfor %}</select>
           </div>
-          <div class="col-md-4"><label class="form-label">Satıcı</label>
-            <select name="assigned_sales_rep" class="form-select">{% for u in users %}<option value="{{ u.full_name }}">{{ u.full_name }}</option>{% endfor %}</select>
-          </div>
-          <div class="col-md-12"><label class="form-label">Adres</label><textarea name="address" class="form-control" rows="2"></textarea></div>
+          <div class="col-md-4"><label class="form-label">Vergi Dairesi</label><input type="text" name="tax_office" class="form-control"></div>
+          <div class="col-md-4"><label class="form-label">Vergi No</label><input type="text" name="tax_number" class="form-control"></div>
+          <div class="col-md-4"><label class="form-label">Ödeme Vadesi</label><input type="text" name="payment_terms" class="form-control" placeholder="Örn: 30 Gün"></div>
+          <div class="col-md-12"><label class="form-label fw-bold text-danger">Adres *</label><textarea name="address" class="form-control" rows="2" placeholder="Firma açık adresi"></textarea></div>
         </div>
-        <div class="modal-footer"><button type="submit" class="btn btn-mim">Kaydet</button></div>
+        <div class="modal-footer"><button type="submit" class="btn btn-mim">Müşteriyi Kaydet</button></div>
     </form>
 </div></div></div>
 
+<!-- Excel Toplu Yükle Modal -->
 <div class="modal fade" id="importExcelModal" tabindex="-1"><div class="modal-dialog"><div class="modal-content">
     <form method="POST" action="/import-excel" enctype="multipart/form-data">
         <div class="modal-header"><h5 class="modal-title text-mim fw-bold">Excel ile Toplu Müşteri Yükle</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
-        <div class="modal-body"><input type="file" name="file" class="form-control" accept=".xlsx, .xls" required></div>
-        <div class="modal-footer"><button type="submit" class="btn btn-success">İçe Aktar</button></div>
+        <div class="modal-body">
+            <p class="small text-muted">Şablondaki sütunlar: <b>Ticaret Sicil No, Unvan, Adres, Firma Tel, Firma Mail</b></p>
+            <input type="file" name="file" class="form-control" accept=".xlsx, .xls" required>
+        </div>
+        <div class="modal-footer"><button type="submit" class="btn btn-success">Excel'i İçe Aktar</button></div>
     </form>
 </div></div></div>
 """)
@@ -384,7 +444,7 @@ CUSTOMER_DETAIL_HTML = BASE_HTML.replace('{% block content %}{% endblock %}', ""
 <ul class="nav nav-tabs flex-wrap" id="customerTab" role="tablist">
   <li class="nav-item"><button class="nav-link active" data-bs-toggle="tab" data-bs-target="#tab-info"><i class="fa-solid fa-id-card me-1 text-mim"></i>Müşteri Künyesi</button></li>
   <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-proposals"><i class="fa-solid fa-file-invoice-dollar me-1 text-mim"></i>Teklifler</button></li>
-  <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-interactions"><i class="fa-solid fa-comments me-1 text-mim"></i>Görüşmeler</button></li>
+  <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-interactions"><i class="fa-solid fa-comments me-1 text-mim"></i>Görüşmeler & Randevu Planı</button></li>
   <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-docs"><i class="fa-solid fa-folder-open me-1 text-mim"></i>Belgeler</button></li>
   <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-sales"><i class="fa-solid fa-cart-shopping me-1 text-mim"></i>Siparişler</button></li>
   <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-production"><i class="fa-solid fa-gears me-1 text-danger"></i>Üretim Notları</button></li>
@@ -395,27 +455,27 @@ CUSTOMER_DETAIL_HTML = BASE_HTML.replace('{% block content %}{% endblock %}', ""
         <div class="row g-4">
             <div class="col-md-6">
                 <div class="p-3 bg-light rounded border h-100">
-                    <h6 class="fw-bold text-mim mb-3"><i class="fa-solid fa-address-book me-2"></i>İletişim</h6>
+                    <h6 class="fw-bold text-mim mb-3"><i class="fa-solid fa-address-book me-2"></i>Firma & İletişim Bilgileri</h6>
                     <table class="table table-sm table-borderless">
-                        <tr><th width="35%">Firma:</th><td class="fw-bold">{{ customer.company_name }}</td></tr>
-                        <tr><th>Yetkili:</th><td>{{ customer.contact_person }}</td></tr>
-                        <tr><th>E-Posta:</th><td><a href="mailto:{{ customer.email }}" class="text-mim">{{ customer.email }}</a></td></tr>
-                        <tr><th>Telefon:</th><td>{{ customer.phone }}</td></tr>
-                        <tr><th>Kategori:</th><td><span class="badge badge-mim">{{ customer.category }}</span></td></tr>
-                        <tr><th>Satıcı:</th><td><span class="badge bg-secondary">{{ customer.assigned_sales_rep }}</span></td></tr>
+                        <tr><th width="35%">Unvan:</th><td class="fw-bold">{{ customer.company_name }}</td></tr>
+                        <tr><th>Ticaret Sicil No:</th><td class="fw-bold text-primary">{{ customer.trade_registry_no or '-' }}</td></tr>
+                        <tr><th>Yetkili Kişi:</th><td>{{ customer.contact_person or '-' }}</td></tr>
+                        <tr><th>Firma Mail:</th><td><a href="mailto:{{ customer.email }}" class="text-mim">{{ customer.email }}</a></td></tr>
+                        <tr><th>Firma Tel:</th><td>{{ customer.phone }}</td></tr>
+                        <tr><th>Adres:</th><td>{{ customer.address or '-' }}</td></tr>
                     </table>
                 </div>
             </div>
             <div class="col-md-6">
                 <div class="p-3 bg-light rounded border h-100">
-                    <h6 class="fw-bold text-mim mb-3"><i class="fa-solid fa-receipt me-2"></i>Fatura & Muhasebe</h6>
+                    <h6 class="fw-bold text-mim mb-3"><i class="fa-solid fa-receipt me-2"></i>Fatura & Muhasebe Bilgileri</h6>
                     <table class="table table-sm table-borderless">
                         <tr><th width="35%">Vergi Dairesi:</th><td>{{ customer.tax_office or '-' }}</td></tr>
                         <tr><th>Vergi No:</th><td>{{ customer.tax_number or '-' }}</td></tr>
-                        <tr><th>Vade:</th><td>{{ customer.payment_terms or 'Peşin' }}</td></tr>
+                        <tr><th>Ödeme Vadesi:</th><td>{{ customer.payment_terms or 'Peşin' }}</td></tr>
                         <tr><th>Kredi Limiti:</th><td>{{ "{:,.2f}".format(customer.credit_limit) }} ₺</td></tr>
                         <tr><th>Cari Bakiye:</th><td class="fw-bold text-danger">{{ "{:,.2f}".format(customer.current_balance) }} ₺</td></tr>
-                        <tr><th>Adres:</th><td>{{ customer.address or '-' }}</td></tr>
+                        <tr><th>Temsilci:</th><td><span class="badge bg-secondary">{{ customer.assigned_sales_rep }}</span></td></tr>
                     </table>
                 </div>
             </div>
@@ -427,58 +487,71 @@ CUSTOMER_DETAIL_HTML = BASE_HTML.replace('{% block content %}{% endblock %}', ""
             <h5>Teklifler</h5>
             <button class="btn btn-sm btn-mim" data-bs-toggle="modal" data-bs-target="#addProposalModal">+ Teklif Hazırla</button>
         </div>
-        <table class="table align-middle">
-            <thead class="table-light"><tr><th>Kod</th><th>Başlık</th><th>Hazırlayan</th><th>Tutar</th><th>Tarih</th><th>Durum</th><th class="text-end">İşlemler</th></tr></thead>
-            <tbody>
-                {% for p in proposals %}
-                <tr>
-                    <td><span class="badge badge-mim">{{ p.code }}</span></td>
-                    <td class="fw-bold">{{ p.title }}</td>
-                    <td>{{ p.created_by }}</td>
-                    <td class="text-success fw-bold">{{ "{:,.2f}".format(p.total_amount) }} ₺</td>
-                    <td>{{ p.created_date.strftime('%d.%m.%Y') }}</td>
-                    <td><span class="badge bg-info">{{ p.status }}</span></td>
-                    <td class="text-end">
-                        <a href="/proposal/view/{{ p.id }}" target="_blank" class="btn btn-sm btn-outline-mim"><i class="fa-solid fa-eye"></i> İncele / PDF</a>
-                        <button class="btn btn-sm btn-outline-warning" data-bs-toggle="modal" data-bs-target="#reviseModal{{ p.id }}"><i class="fa-solid fa-code-branch"></i> Revize</button>
-                        <button class="btn btn-sm btn-outline-danger" data-bs-toggle="modal" data-bs-target="#sendEmailModal{{ p.id }}"><i class="fa-brands fa-google"></i> Mail</button>
-                    </td>
-                </tr>
+        <div class="table-responsive">
+            <table class="table align-middle">
+                <thead class="table-light"><tr><th>Kod</th><th>Başlık</th><th>Hazırlayan</th><th>Tutar</th><th>Tarih</th><th>Durum</th><th class="text-end">İşlemler</th></tr></thead>
+                <tbody>
+                    {% for p in proposals %}
+                    <tr>
+                        <td><span class="badge badge-mim">{{ p.code }}</span></td>
+                        <td class="fw-bold">{{ p.title }}</td>
+                        <td>{{ p.created_by }}</td>
+                        <td class="text-success fw-bold">{{ "{:,.2f}".format(p.total_amount) }} ₺</td>
+                        <td>{{ p.created_date.strftime('%d.%m.%Y') }}</td>
+                        <td><span class="badge bg-info">{{ p.status }}</span></td>
+                        <td class="text-end">
+                            <a href="/proposal/view/{{ p.id }}" target="_blank" class="btn btn-sm btn-outline-mim"><i class="fa-solid fa-eye"></i> İncele / PDF</a>
+                            <button class="btn btn-sm btn-outline-warning" data-bs-toggle="modal" data-bs-target="#reviseModal{{ p.id }}"><i class="fa-solid fa-code-branch"></i> Revize</button>
+                            <button class="btn btn-sm btn-outline-danger" data-bs-toggle="modal" data-bs-target="#sendEmailModal{{ p.id }}"><i class="fa-brands fa-google"></i> Mail</button>
+                        </td>
+                    </tr>
 
-                <div class="modal fade" id="reviseModal{{ p.id }}" tabindex="-1"><div class="modal-dialog modal-lg"><div class="modal-content">
-                    <form method="POST" action="/proposal/revise/{{ p.id }}">
-                        <div class="modal-header"><h5 class="modal-title text-mim fw-bold">Teklif Revizesi: {{ p.code }}</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
-                        <div class="modal-body row g-3 text-start">
-                            <div class="col-md-12"><input type="text" name="title" class="form-control" value="{{ p.title }} (Revize)" required></div>
-                            <div class="col-md-12"><input type="number" step="0.01" name="total_amount" class="form-control" value="{{ p.total_amount }}" required></div>
-                            <div class="col-md-12"><textarea name="notes" class="form-control" rows="3">{{ p.notes or '' }}</textarea></div>
-                        </div>
-                        <div class="modal-footer"><button type="submit" class="btn btn-mim">Revize Kaydet</button></div>
-                    </form>
-                </div></div></div>
+                    <div class="modal fade" id="reviseModal{{ p.id }}" tabindex="-1"><div class="modal-dialog modal-lg"><div class="modal-content">
+                        <form method="POST" action="/proposal/revise/{{ p.id }}">
+                            <div class="modal-header"><h5 class="modal-title text-mim fw-bold">Teklif Revizesi: {{ p.code }}</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
+                            <div class="modal-body row g-3 text-start">
+                                <div class="col-md-12"><input type="text" name="title" class="form-control" value="{{ p.title }} (Revize)" required></div>
+                                <div class="col-md-12"><input type="number" step="0.01" name="total_amount" class="form-control" value="{{ p.total_amount }}" required></div>
+                                <div class="col-md-12"><textarea name="notes" class="form-control" rows="3">{{ p.notes or '' }}</textarea></div>
+                            </div>
+                            <div class="modal-footer"><button type="submit" class="btn btn-mim">Kaydet</button></div>
+                        </form>
+                    </div></div></div>
 
-                <div class="modal fade" id="sendEmailModal{{ p.id }}" tabindex="-1"><div class="modal-dialog"><div class="modal-content">
-                    <form method="POST" action="/proposal/{{ p.id }}/send-email">
-                        <div class="modal-header"><h5 class="modal-title text-mim fw-bold">Mail İlet</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
-                        <div class="modal-body row g-3 text-start">
-                            <div class="col-md-12"><input type="email" name="to_email" class="form-control" value="{{ customer.email }}" required></div>
-                            <div class="col-md-12"><input type="text" name="cc_emails" class="form-control" placeholder="CC Adresleri"></div>
-                            <div class="col-md-12"><textarea name="extra_note" class="form-control" rows="3">Teklifimiz ekte sunulmuştur.</textarea></div>
-                        </div>
-                        <div class="modal-footer"><button type="submit" class="btn btn-danger">Gönder</button></div>
-                    </form>
-                </div></div></div>
-                {% else %}<tr><td colspan="7" class="text-muted">Teklif bulunmuyor.</td></tr>{% endfor %}
-            </tbody>
-        </table>
+                    <div class="modal fade" id="sendEmailModal{{ p.id }}" tabindex="-1"><div class="modal-dialog"><div class="modal-content">
+                        <form method="POST" action="/proposal/{{ p.id }}/send-email">
+                            <div class="modal-header"><h5 class="modal-title text-mim fw-bold">Teklifi İlet</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
+                            <div class="modal-body row g-3 text-start">
+                                <div class="col-md-12"><label class="form-label fw-bold">Alıcı E-Postası</label><input type="email" name="to_email" class="form-control" value="{{ customer.email }}" required></div>
+                                <div class="col-md-12"><label class="form-label fw-bold text-mim">CC (Bilgi)</label><input type="text" name="cc_emails" class="form-control" placeholder="patron@mimreklam.com"></div>
+                                <div class="col-md-12"><label class="form-label fw-bold">Mesajınız</label><textarea name="extra_note" class="form-control" rows="3">Teklifimiz ekte sunulmuştur.</textarea></div>
+                                <div class="col-md-12"><small class="text-muted"><i class="fa-solid fa-signature me-1"></i> Gönderen personelin mail imzası otomatik eklenecektir.</small></div>
+                            </div>
+                            <div class="modal-footer"><button type="submit" class="btn btn-danger">Gönder</button></div>
+                        </form>
+                    </div></div></div>
+                    {% else %}<tr><td colspan="7" class="text-muted">Teklif bulunmuyor.</td></tr>{% endfor %}
+                </tbody>
+            </table>
+        </div>
     </div>
 
+    <!-- 3. GÖRÜŞMELER & İLERİ TARİHLİ RANDEVU PLANI (30 DK ÖNCEDEN UYARI) -->
     <div class="tab-pane fade" id="tab-interactions">
-        <div class="d-flex justify-content-between mb-3"><h5>Görüşmeler</h5><button class="btn btn-sm btn-mim" data-bs-toggle="modal" data-bs-target="#addInteractionModal">+ Not</button></div>
+        <div class="d-flex justify-content-between mb-3">
+            <h5>Görüşmeler & Planlanan Randevular</h5>
+            <button class="btn btn-sm btn-mim" data-bs-toggle="modal" data-bs-target="#addInteractionModal">+ Görüşme / Randevu Ekle</button>
+        </div>
         {% for i in interactions %}
         <div class="p-3 border-bottom mb-2 bg-light rounded">
-            <strong><i class="fa-solid fa-user me-1 text-mim"></i>{{ i.sales_rep }}</strong> - <small class="text-muted">{{ i.interaction_date.strftime('%d.%m.%Y %H:%M') }}</small>
-            <p class="mb-1 mt-1"><strong>Müşteri:</strong> {{ i.customer_feedback }}</p>
+            <div class="d-flex justify-content-between">
+                <strong><i class="fa-solid fa-user me-1 text-mim"></i>{{ i.sales_rep }}</strong>
+                <small class="text-muted">{{ i.interaction_date.strftime('%d.%m.%Y %H:%M') }} | Yer: {{ i.location or 'Ofis' }}</small>
+            </div>
+            {% if i.planned_datetime %}
+            <div class="mt-1"><span class="badge bg-danger"><i class="fa-solid fa-clock me-1"></i>Planlanan Randevu: {{ i.planned_datetime.strftime('%d.%m.%Y %H:%M') }}</span></div>
+            {% endif %}
+            <p class="mb-1 mt-2"><strong>Müşteri Geri Bildirimi:</strong> {{ i.customer_feedback }}</p>
             <p class="mb-0"><strong>Not:</strong> {{ i.notes }}</p>
         </div>
         {% else %}<p class="text-muted">Görüşme kaydı yok.</p>{% endfor %}
@@ -520,9 +593,26 @@ CUSTOMER_DETAIL_HTML = BASE_HTML.replace('{% block content %}{% endblock %}', ""
     </div>
 </div>
 
+<!-- Görüşme & İleri Randevu Ekle Modal -->
+<div class="modal fade" id="addInteractionModal" tabindex="-1"><div class="modal-dialog modal-lg"><div class="modal-content"><form method="POST" action="/customer/{{ customer.id }}/add-interaction">
+    <div class="modal-header"><h5 class="modal-title text-mim fw-bold">Görüşme Notu & İleri Randevu Planı</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
+    <div class="modal-body row g-3">
+        <div class="col-md-6"><label class="form-label fw-bold">Temsilci</label><input type="text" name="sales_rep" class="form-control" value="{{ session.get('full_name') }}"></div>
+        <div class="col-md-6"><label class="form-label fw-bold">Yer / Tip</label><input type="text" name="location" class="form-control" placeholder="Ofis / Şantiye / Telefon"></div>
+        <div class="col-md-12 p-3 bg-light rounded border">
+            <label class="form-label fw-bold text-danger"><i class="fa-solid fa-calendar-plus me-1"></i> İleri Tarihli Randevu Planla (30 Dk Öncesinden Sistem Uyarır)</label>
+            <input type="datetime-local" name="planned_datetime" class="form-control">
+        </div>
+        <div class="col-md-12"><label class="form-label fw-bold">Müşteri Ne Dedi?</label><textarea name="customer_feedback" class="form-control" rows="2"></textarea></div>
+        <div class="col-md-12"><label class="form-label fw-bold">Görüşme Detay Notu</label><textarea name="notes" class="form-control" rows="2"></textarea></div>
+        <div class="col-md-12"><label class="form-label fw-bold">Sonuç</label><input type="text" name="result" class="form-control" placeholder="Teklif bekleniyor / Karar verilecek"></div>
+    </div>
+    <div class="modal-footer"><button type="submit" class="btn btn-mim">Kaydet</button></div>
+</form></div></div></div>
+
 <div class="modal fade" id="addProposalModal" tabindex="-1"><div class="modal-dialog modal-xl"><div class="modal-content">
     <form method="POST" action="/customer/{{ customer.id }}/add-proposal">
-        <div class="modal-header"><h5 class="modal-title text-mim fw-bold">Teklif Hazırla</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
+        <div class="modal-header"><h5 class="modal-title text-mim fw-bold">Fiyat Teklifi Hazırla</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
         <div class="modal-body row g-3">
             <div class="col-md-8"><input type="text" name="title" class="form-control" required placeholder="Teklif Başlığı"></div>
             <div class="col-md-4"><input type="text" name="created_by" class="form-control" value="{{ session.get('full_name') }}" readonly></div>
@@ -534,7 +624,7 @@ CUSTOMER_DETAIL_HTML = BASE_HTML.replace('{% block content %}{% endblock %}', ""
                         <div class="col-md-2"><input type="number" step="0.01" name="item_price[]" class="form-control price" placeholder="Fiyat" required></div>
                         <div class="col-md-2"><select name="item_tax[]" class="form-select tax"><option value="20">%20</option><option value="10">%10</option><option value="1">%1</option><option value="0">%0</option></select></div>
                         <div class="col-md-1 d-flex align-items-end"><button type="button" class="btn btn-outline-danger w-100 remove-row-btn"><i class="fa-solid fa-trash"></i></button></div>
-                        <div class="col-md-12 mt-2"><input type="text" name="item_desc[]" class="form-control form-control-sm" placeholder="Açıklama / Teknik Detay"></div>
+                        <div class="col-md-12 mt-2"><input type="text" name="item_desc[]" class="form-control form-control-sm" placeholder="Kalem Açıklaması / Teknik Detay"></div>
                     </div>
                 </div>
             </div>
@@ -570,10 +660,134 @@ document.addEventListener('click', function(e) {
 });
 </script>
 
-<div class="modal fade" id="addInteractionModal" tabindex="-1"><div class="modal-dialog modal-lg"><div class="modal-content"><form method="POST" action="/customer/{{ customer.id }}/add-interaction"><div class="modal-header"><h5 class="modal-title">Görüşme Notu</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div><div class="modal-body row g-3"><div class="col-md-6"><input type="text" name="sales_rep" class="form-control" value="{{ session.get('full_name') }}"></div><div class="col-md-6"><input type="text" name="location" class="form-control" placeholder="Yer / Tip"></div><div class="col-md-12"><textarea name="customer_feedback" class="form-control" placeholder="Müşteri Ne Dedi?" rows="2"></textarea></div><div class="col-md-12"><textarea name="notes" class="form-control" placeholder="Detay" rows="2"></textarea></div><div class="col-md-12"><input type="text" name="result" class="form-control" placeholder="Sonuç"></div></div><div class="modal-footer"><button type="submit" class="btn btn-mim">Kaydet</button></div></form></div></div></div>
-<div class="modal fade" id="uploadDocModal" tabindex="-1"><div class="modal-dialog"><div class="modal-content"><form method="POST" action="/customer/{{ customer.id }}/upload-doc" enctype="multipart/form-data"><div class="modal-header"><h5 class="modal-title">Belge Yükle</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div><div class="modal-body row g-3"><div class="col-md-12"><select name="file_type" class="form-select"><option value="Sözleşme">Sözleşme</option><option value="Teknik Şartname">Teknik Şartname</option><option value="İhale">İhale</option><option value="Proje">Proje</option></select></div><div class="col-md-12"><input type="file" name="file" class="form-control" required></div></div><div class="modal-footer"><button type="submit" class="btn btn-mim">Yükle</button></div></form></div></div></div>
-<div class="modal fade" id="addSaleModal" tabindex="-1"><div class="modal-dialog"><div class="modal-content"><form method="POST" action="/customer/{{ customer.id }}/add-sale"><div class="modal-header"><h5 class="modal-title">Sipariş Kaydı</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div><div class="modal-body row g-3"><div class="col-md-12"><input type="text" name="job_title" class="form-control" placeholder="İş Adı" required></div><div class="col-md-6"><input type="number" step="0.01" name="sale_amount" class="form-control" placeholder="Tutar" required></div><div class="col-md-6"><input type="number" step="0.01" name="paid_amount" class="form-control" placeholder="Tahsilat" value="0.00"></div><div class="col-md-6"><select name="payment_status" class="form-select"><option value="Ödendi">Ödendi</option><option value="Bekliyor">Bekliyor</option></select></div><div class="col-md-6"><input type="date" name="delivery_date" class="form-control"></div></div><div class="modal-footer"><button type="submit" class="btn btn-mim">Kaydet</button></div></form></div></div></div>
+<div class="modal fade" id="uploadDocModal" tabindex="-1"><div class="modal-dialog"><div class="modal-content"><form method="POST" action="/customer/{{ customer.id }}/upload-doc" enctype="multipart/form-data"><div class="modal-header"><h5 class="modal-title text-mim fw-bold">Belge Yükle</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div><div class="modal-body row g-3"><div class="col-md-12"><select name="file_type" class="form-select"><option value="Sözleşme">Sözleşme</option><option value="Teknik Şartname">Teknik Şartname</option><option value="İhale">İhale</option><option value="Proje">Proje</option></select></div><div class="col-md-12"><input type="file" name="file" class="form-control" required></div></div><div class="modal-footer"><button type="submit" class="btn btn-mim">Yükle</button></div></form></div></div></div>
+<div class="modal fade" id="addSaleModal" tabindex="-1"><div class="modal-dialog"><div class="modal-content"><form method="POST" action="/customer/{{ customer.id }}/add-sale"><div class="modal-header"><h5 class="modal-title text-mim fw-bold">Sipariş Kaydı</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div><div class="modal-body row g-3"><div class="col-md-12"><input type="text" name="job_title" class="form-control" placeholder="İş Adı" required></div><div class="col-md-6"><input type="number" step="0.01" name="sale_amount" class="form-control" placeholder="Tutar" required></div><div class="col-md-6"><input type="number" step="0.01" name="paid_amount" class="form-control" placeholder="Tahsilat" value="0.00"></div><div class="col-md-6"><select name="payment_status" class="form-select"><option value="Ödendi">Ödendi</option><option value="Bekliyor">Bekliyor</option></select></div><div class="col-md-6"><input type="date" name="delivery_date" class="form-control"></div></div><div class="modal-footer"><button type="submit" class="btn btn-mim">Kaydet</button></div></form></div></div></div>
 <div class="modal fade" id="addProductionModal" tabindex="-1"><div class="modal-dialog"><div class="modal-content"><form method="POST" action="/customer/{{ customer.id }}/add-production-issue"><div class="modal-header"><h5 class="modal-title text-danger fw-bold">Üretim Aksaklığı</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div><div class="modal-body row g-3"><div class="col-md-12"><select name="sale_id" class="form-select">{% for s in sales %}<option value="{{ s.id }}">{{ s.job_title }}</option>{% else %}<option value="">Kayıtlı İş Yok</option>{% endfor %}</select></div><div class="col-md-12"><textarea name="issue_description" class="form-control" placeholder="Sorun Açıklaması" required></textarea></div><div class="col-md-12"><textarea name="sales_notes" class="form-control" placeholder="Not"></textarea></div></div><div class="modal-footer"><button type="submit" class="btn btn-danger">Kaydet</button></div></form></div></div></div>
+""")
+
+# GÖREVLER PANELİ (SİL VE DÜZENLE EKLENMİŞ HALİ)
+TASKS_HTML = BASE_HTML.replace('{% block content %}{% endblock %}', """
+<div class="d-flex justify-content-between align-items-center mb-4 flex-wrap gap-2">
+    <h2><i class="fa-solid fa-list-check text-mim me-2"></i>Görev ve İş Takip Paneli</h2>
+    <button class="btn btn-mim" data-bs-toggle="modal" data-bs-target="#addTaskModal"><i class="fa-solid fa-plus me-1"></i>Yeni Görev Ata</button>
+</div>
+
+<ul class="nav nav-pills mb-3">
+  <li class="nav-item"><a class="nav-link {% if view_type != 'all' %}active bg-mim{% endif %}" href="/tasks?view=my">Bana Atanan Görevlerim</a></li>
+  <li class="nav-item"><a class="nav-link {% if view_type == 'all' %}active bg-mim{% endif %}" href="/tasks?view=all">Tüm Şirket Görevleri</a></li>
+</ul>
+
+<div class="card card-custom p-3 table-responsive">
+    <table class="table table-hover align-middle">
+        <thead class="table-light">
+            <tr>
+                <th>Görev Konusu</th>
+                <th>İlgili Müşteri</th>
+                <th>Görevi Atayan</th>
+                <th>Atanan Personel</th>
+                <th>Son Tarih</th>
+                <th>Öncelik</th>
+                <th>Durum</th>
+                <th class="text-end">İşlemler</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for t in tasks %}
+            <tr>
+                <td><strong>{{ t.title }}</strong><br><small class="text-muted">{{ t.description or '' }}</small></td>
+                <td>{{ t.customer_name }}</td>
+                <td><small>{{ t.assigned_by }}</small></td>
+                <td><span class="badge bg-secondary">{{ t.assigned_to }}</span></td>
+                <td><span class="badge bg-outline-dark text-dark">{{ t.due_date.strftime('%d.%m.%Y') }}</span></td>
+                <td>
+                    {% if t.priority == 'Acil' %}<span class="badge bg-danger">Acil</span>
+                    {% elif t.priority == 'Yüksek' %}<span class="badge bg-warning text-dark">Yüksek</span>
+                    {% else %}<span class="badge bg-secondary">{{ t.priority }}</span>{% endif %}
+                </td>
+                <td>
+                    {% if t.status == 'Tamamlandı' %}<span class="badge bg-success">Tamamlandı</span>
+                    {% elif t.status == 'Tamamlanamadı' %}
+                        <span class="badge bg-danger">Tamamlanamadı</span>
+                        <button class="btn btn-sm btn-link text-danger p-0 ms-1" data-bs-toggle="modal" data-bs-target="#reasonModal{{ t.id }}" title="Nedeni Gör"><i class="fa-solid fa-circle-question"></i></button>
+                    {% else %}<span class="badge bg-warning text-dark">Bekliyor</span>{% endif %}
+                </td>
+                <td class="text-end">
+                    <button class="btn btn-sm btn-outline-success" data-bs-toggle="modal" data-bs-target="#updateTaskModal{{ t.id }}" title="Durum Güncelle"><i class="fa-solid fa-check"></i></button>
+                    <button class="btn btn-sm btn-outline-warning" data-bs-toggle="modal" data-bs-target="#editTaskModal{{ t.id }}" title="Görevi Düzenle"><i class="fa-solid fa-pen"></i></button>
+                    <a href="/task/delete/{{ t.id }}" class="btn btn-sm btn-outline-danger" onclick="return confirm('Bu görevi silmek istediğinize emin misiniz?');" title="Görevi Sil"><i class="fa-solid fa-trash"></i></a>
+                </td>
+            </tr>
+
+            <!-- Görev Düzenle Modal -->
+            <div class="modal fade" id="editTaskModal{{ t.id }}" tabindex="-1"><div class="modal-dialog modal-lg"><div class="modal-content">
+                <form method="POST" action="/task/edit/{{ t.id }}">
+                    <div class="modal-header"><h5 class="modal-title text-mim fw-bold">Görevi Düzenle</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
+                    <div class="modal-body row g-3">
+                        <div class="col-md-8"><label class="form-label fw-bold">Görev Başlığı *</label><input type="text" name="title" class="form-control" value="{{ t.title }}" required></div>
+                        <div class="col-md-4"><label class="form-label fw-bold">Atanan Personel</label>
+                            <select name="assigned_to" class="form-select">
+                                {% for u in users %}<option value="{{ u.full_name }}" {% if t.assigned_to == u.full_name %}selected{% endif %}>{{ u.full_name }}</option>{% endfor %}
+                            </select>
+                        </div>
+                        <div class="col-md-6"><label class="form-label">İlgili Müşteri</label>
+                            <select name="customer_id" class="form-select">
+                                <option value="">-- Müşteri Seçilmedi --</option>
+                                {% for c in customers %}<option value="{{ c.id }}" {% if t.customer_id == c.id %}selected{% endif %}>{{ c.company_name }}</option>{% endfor %}
+                            </select>
+                        </div>
+                        <div class="col-md-3"><label class="form-label fw-bold">Son Tarih</label><input type="date" name="due_date" class="form-control" value="{{ t.due_date.strftime('%Y-%m-%d') }}" required></div>
+                        <div class="col-md-3"><label class="form-label">Öncelik</label>
+                            <select name="priority" class="form-select">
+                                <option value="Normal" {% if t.priority == 'Normal' %}selected{% endif %}>Normal</option>
+                                <option value="Yüksek" {% if t.priority == 'Yüksek' %}selected{% endif %}>Yüksek</option>
+                                <option value="Acil" {% if t.priority == 'Acil' %}selected{% endif %}>Acil</option>
+                                <option value="Düşük" {% if t.priority == 'Düşük' %}selected{% endif %}>Düşük</option>
+                            </select>
+                        </div>
+                        <div class="col-md-12"><label class="form-label">Açıklama</label><textarea name="description" class="form-control" rows="3">{{ t.description or '' }}</textarea></div>
+                    </div>
+                    <div class="modal-footer"><button type="submit" class="btn btn-mim">Güncelle</button></div>
+                </form>
+            </div></div></div>
+
+            <!-- Gerekçe Modalı -->
+            {% if t.status == 'Tamamlanamadı' %}
+            <div class="modal fade" id="reasonModal{{ t.id }}" tabindex="-1"><div class="modal-dialog"><div class="modal-content">
+                <div class="modal-header bg-danger text-white"><h5 class="modal-title">Görevin Tamamlanamama Gerekçesi</h5><button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button></div>
+                <div class="modal-body"><p class="p-3 bg-light rounded text-danger">{{ t.reason or 'Açıklama girilmemiş.' }}</p></div>
+            </div></div></div>
+            {% endif %}
+
+            <!-- Durum Güncelle Modal -->
+            <div class="modal fade" id="updateTaskModal{{ t.id }}" tabindex="-1"><div class="modal-dialog"><div class="modal-content">
+                <form method="POST" action="/task/update/{{ t.id }}">
+                    <div class="modal-header"><h5 class="modal-title text-mim fw-bold">Görev Durumu Güncelle</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
+                    <div class="modal-body row g-3">
+                        <div class="col-md-12"><select name="status" class="form-select"><option value="Bekliyor">Bekliyor</option><option value="Tamamlandı">Tamamlandı</option><option value="Tamamlanamadı">Tamamlanamadı</option></select></div>
+                        <div class="col-md-12"><textarea name="reason" class="form-control" placeholder="Tamamlanamadıysa nedeni">{{ t.reason or '' }}</textarea></div>
+                    </div>
+                    <div class="modal-footer"><button type="submit" class="btn btn-mim">Kaydet</button></div>
+                </form>
+            </div></div></div>
+            {% else %}<tr><td colspan="8" class="text-center py-4 text-muted">Görev bulunamadı.</td></tr>{% endfor %}
+        </tbody>
+    </table>
+</div>
+
+<div class="modal fade" id="addTaskModal" tabindex="-1"><div class="modal-dialog modal-lg"><div class="modal-content">
+    <form method="POST" action="/task/add">
+        <div class="modal-header"><h5 class="modal-title text-mim fw-bold">Yeni Görev Ata</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
+        <div class="modal-body row g-3">
+            <div class="col-md-8"><input type="text" name="title" class="form-control" required placeholder="Görev Başlığı"></div>
+            <div class="col-md-4"><select name="assigned_to" class="form-select">{% for u in users %}<option value="{{ u.full_name }}">{{ u.full_name }}</option>{% endfor %}</select></div>
+            <div class="col-md-6"><select name="customer_id" class="form-select"><option value="">-- Müşteri Seçilmedi --</option>{% for c in customers %}<option value="{{ c.id }}">{{ c.company_name }}</option>{% endfor %}</select></div>
+            <div class="col-md-3"><input type="date" name="due_date" class="form-control" required></div>
+            <div class="col-md-3"><select name="priority" class="form-select"><option value="Normal">Normal</option><option value="Yüksek">Yüksek</option><option value="Acil">Acil</option></select></div>
+            <div class="col-md-12"><textarea name="description" class="form-control" placeholder="Detay"></textarea></div>
+        </div>
+        <div class="modal-footer"><button type="submit" class="btn btn-mim">Ata</button></div>
+    </form>
+</div></div></div>
 """)
 
 PROPOSAL_VIEW_HTML = """
@@ -625,10 +839,9 @@ PROPOSAL_VIEW_HTML = """
                 <div class="p-3 bg-light rounded border">
                     <h6 class="fw-bold text-mim">MÜŞTERİ / FİRMA:</h6>
                     <h5 class="fw-bold mb-1">{{ customer.company_name }}</h5>
-                    <p class="mb-0 small"><strong>Yetkili:</strong> {{ customer.contact_person }}</p>
+                    <p class="mb-0 small"><strong>Yetkili:</strong> {{ customer.contact_person or '-' }}</p>
                     <p class="mb-0 small"><strong>E-Posta:</strong> {{ customer.email }} | <strong>Tel:</strong> {{ customer.phone }}</p>
                     <p class="mb-0 small"><strong>Adres:</strong> {{ customer.address or '-' }}</p>
-                    <p class="mb-0 small"><strong>Vergi:</strong> {{ customer.tax_office or '-' }} / {{ customer.tax_number or '-' }}</p>
                 </div>
             </div>
             <div class="col-6">
@@ -709,82 +922,135 @@ function downloadPDF() {
 </html>
 """
 
-TASKS_HTML = BASE_HTML.replace('{% block content %}{% endblock %}', """
-<div class="d-flex justify-content-between align-items-center mb-4 flex-wrap gap-2">
-    <h2><i class="fa-solid fa-list-check text-mim me-2"></i>Görevler Paneli</h2>
-    <button class="btn btn-mim" data-bs-toggle="modal" data-bs-target="#addTaskModal">+ Görev Ata</button>
-</div>
-
-<ul class="nav nav-pills mb-3">
-  <li class="nav-item"><a class="nav-link {% if view_type != 'all' %}active bg-mim{% endif %}" href="/tasks?view=my">Bana Atanan Görevler</a></li>
-  <li class="nav-item"><a class="nav-link {% if view_type == 'all' %}active bg-mim{% endif %}" href="/tasks?view=all">Tüm Görevler</a></li>
-</ul>
-
-<div class="card card-custom p-3 table-responsive">
-    <table class="table table-hover align-middle">
-        <thead class="table-light"><tr><th>Görev</th><th>Müşteri</th><th>Atayan</th><th>Atanan</th><th>Son Tarih</th><th>Öncelik</th><th>Durum</th><th class="text-end">İşlemler</th></tr></thead>
-        <tbody>
-            {% for t in tasks %}
-            <tr>
-                <td><strong>{{ t.title }}</strong><br><small class="text-muted">{{ t.description or '' }}</small></td>
-                <td>{{ t.customer_name }}</td>
-                <td><small>{{ t.assigned_by }}</small></td>
-                <td><span class="badge bg-secondary">{{ t.assigned_to }}</span></td>
-                <td>{{ t.due_date.strftime('%d.%m.%Y') }}</td>
-                <td><span class="badge bg-secondary">{{ t.priority }}</span></td>
-                <td>
-                    {% if t.status == 'Tamamlandı' %}<span class="badge bg-success">Tamamlandı</span>
-                    {% elif t.status == 'Tamamlanamadı' %}
-                        <span class="badge bg-danger">Tamamlanamadı</span>
-                        <button class="btn btn-sm btn-link text-danger p-0 ms-1" data-bs-toggle="modal" data-bs-target="#reasonModal{{ t.id }}"><i class="fa-solid fa-circle-question"></i></button>
-                    {% else %}<span class="badge bg-warning text-dark">Bekliyor</span>{% endif %}
-                </td>
-                <td class="text-end">
-                    <button class="btn btn-sm btn-outline-success" data-bs-toggle="modal" data-bs-target="#updateTaskModal{{ t.id }}">Durum</button>
-                </td>
-            </tr>
-
-            {% if t.status == 'Tamamlanamadı' %}
-            <div class="modal fade" id="reasonModal{{ t.id }}" tabindex="-1"><div class="modal-dialog"><div class="modal-content">
-                <div class="modal-header bg-danger text-white"><h5 class="modal-title">Gerekçe</h5><button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button></div>
-                <div class="modal-body"><p>{{ t.reason or 'Açıklama girilmemiş.' }}</p></div>
-            </div></div></div>
-            {% endif %}
-
-            <div class="modal fade" id="updateTaskModal{{ t.id }}" tabindex="-1"><div class="modal-dialog"><div class="modal-content">
-                <form method="POST" action="/task/update/{{ t.id }}">
-                    <div class="modal-header"><h5 class="modal-title">Durum Güncelle</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
-                    <div class="modal-body row g-3">
-                        <div class="col-md-12"><select name="status" class="form-select"><option value="Bekliyor">Bekliyor</option><option value="Tamamlandı">Tamamlandı</option><option value="Tamamlanamadı">Tamamlanamadı</option></select></div>
-                        <div class="col-md-12"><textarea name="reason" class="form-control" placeholder="Tamamlanamadıysa nedeni">{{ t.reason or '' }}</textarea></div>
-                    </div>
-                    <div class="modal-footer"><button type="submit" class="btn btn-mim">Kaydet</button></div>
-                </form>
-            </div></div></div>
-            {% else %}<tr><td colspan="8" class="text-center py-4 text-muted">Görev bulunamadı.</td></tr>{% endfor %}
-        </tbody>
-    </table>
-</div>
-
-<div class="modal fade" id="addTaskModal" tabindex="-1"><div class="modal-dialog modal-lg"><div class="modal-content">
-    <form method="POST" action="/task/add">
-        <div class="modal-header"><h5 class="modal-title">Görev Ata</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
-        <div class="modal-body row g-3">
-            <div class="col-md-8"><input type="text" name="title" class="form-control" required placeholder="Görev Başlığı"></div>
-            <div class="col-md-4"><select name="assigned_to" class="form-select">{% for u in users %}<option value="{{ u.full_name }}">{{ u.full_name }}</option>{% endfor %}</select></div>
-            <div class="col-md-6"><select name="customer_id" class="form-select"><option value="">-- Müşteri Seçilmedi --</option>{% for c in customers %}<option value="{{ c.id }}">{{ c.company_name }}</option>{% endfor %}</select></div>
-            <div class="col-md-3"><input type="date" name="due_date" class="form-control" required></div>
-            <div class="col-md-3"><select name="priority" class="form-select"><option value="Normal">Normal</option><option value="Yüksek">Yüksek</option><option value="Acil">Acil</option></select></div>
-            <div class="col-md-12"><textarea name="description" class="form-control" placeholder="Detay"></textarea></div>
+# AYARLAR (PERSONEL TITLE + MENÜ YETKİLERİ + MAİL İMZASI + GMAIL)
+SETTINGS_HTML = BASE_HTML.replace('{% block content %}{% endblock %}', """
+<h2 class="mb-4"><i class="fa-solid fa-gears text-mim me-2"></i>Ayarlar & Yetkilendirme</h2>
+<div class="row g-4">
+    <div class="col-md-6">
+        <div class="card card-custom p-4">
+            <h5 class="fw-bold text-mim mb-3">Firma & Teklif Bilgileri</h5>
+            {% if company_logo %}<div class="mb-3 text-center p-2 bg-light rounded"><img src="/uploads/{{ company_logo }}" style="max-height:80px;"></div>{% endif %}
+            <form method="POST" action="/settings/save-company" enctype="multipart/form-data">
+                <div class="mb-2"><input type="file" name="logo" class="form-control form-control-sm" accept="image/*"></div>
+                <div class="mb-2"><input type="text" name="company_name" class="form-control form-control-sm" value="{{ company_name }}" required placeholder="Firma Adı"></div>
+                <div class="mb-2"><input type="text" name="company_address" class="form-control form-control-sm" value="{{ company_address }}" placeholder="Adres"></div>
+                <div class="row g-2 mb-3">
+                    <div class="col-6"><input type="text" name="company_phone" class="form-control form-control-sm" value="{{ company_phone }}" placeholder="Telefon"></div>
+                    <div class="col-6"><input type="email" name="company_email" class="form-control form-control-sm" value="{{ company_email }}" placeholder="E-Posta"></div>
+                </div>
+                <button type="submit" class="btn btn-mim btn-sm">Kaydet</button>
+            </form>
         </div>
-        <div class="modal-footer"><button type="submit" class="btn btn-mim">Ata</button></div>
-    </form>
-</div></div></div>
+    </div>
+    <div class="col-md-6">
+        <div class="card card-custom p-4">
+            <h5 class="fw-bold text-danger mb-3">Genel Sistem Gmail SMTP (Yedek)</h5>
+            <form method="POST" action="/settings/save-gmail">
+                <div class="mb-3"><input type="email" name="gmail_user" class="form-control" value="{{ gmail_user }}" required placeholder="Genel Gmail Adresi"></div>
+                <div class="mb-3"><input type="password" name="gmail_pass" class="form-control" value="{{ gmail_pass }}" required placeholder="16 Haneli Şifre"></div>
+                <button type="submit" class="btn btn-danger btn-sm">Kaydet</button>
+            </form>
+        </div>
+    </div>
+
+    <!-- PERSONEL YÖNETİMİ (TITLE, MAİL, İMZA, MENÜ YETKİLERİ) -->
+    <div class="col-md-12">
+        <div class="card card-custom p-4">
+            <div class="d-flex justify-content-between align-items-center mb-3">
+                <h5 class="fw-bold text-mim mb-0"><i class="fa-solid fa-user-gear me-2"></i>Personel Yönetimi, Unvanlar, E-Postalar & Menü Yetkileri</h5>
+                <button class="btn btn-sm btn-mim" data-bs-toggle="modal" data-bs-target="#addUserModal">+ Yeni Personel Tanımla</button>
+            </div>
+            <div class="table-responsive">
+                <table class="table align-middle">
+                    <thead class="table-light"><tr><th>Kullanıcı</th><th>Ad Soyad</th><th>Unvan (Title)</th><th>Kurumsal E-Posta</th><th>Yetkili Menüler</th><th>Rol</th><th>İşlem</th></tr></thead>
+                    <tbody>
+                        {% for u in users %}
+                        <tr>
+                            <td class="fw-bold">{{ u.username }}</td>
+                            <td>{{ u.full_name }}</td>
+                            <td><span class="badge bg-secondary">{{ u.title or 'Satış Temsilcisi' }}</span></td>
+                            <td>{{ u.email or '-' }}</td>
+                            <td><small class="text-muted">{{ u.allowed_menus }}</small></td>
+                            <td><span class="badge bg-{{ 'primary' if u.role == 'Admin' else 'info' }}">{{ u.role }}</span></td>
+                            <td>
+                                <button class="btn btn-sm btn-outline-warning me-1" data-bs-toggle="modal" data-bs-target="#editUserModal{{ u.id }}"><i class="fa-solid fa-pen"></i></button>
+                                {% if u.username != 'admin' %}
+                                <a href="/settings/delete-user/{{ u.id }}" class="btn btn-sm btn-outline-danger" onclick="return confirm('Kullanıcıyı silmek istediğinize emin misiniz?');"><i class="fa-solid fa-trash"></i></a>
+                                {% endif %}
+                            </td>
+                        </tr>
+
+                        <!-- Personel Düzenle Modal -->
+                        <div class="modal fade" id="editUserModal{{ u.id }}" tabindex="-1"><div class="modal-dialog modal-lg"><div class="modal-content">
+                            <form method="POST" action="/settings/edit-user/{{ u.id }}">
+                                <div class="modal-header"><h5 class="modal-title text-mim fw-bold">{{ u.full_name }} - Personel Ayarları</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
+                                <div class="modal-body row g-3">
+                                    <div class="col-md-6"><label class="form-label fw-bold">Ad Soyad</label><input type="text" name="full_name" class="form-control" value="{{ u.full_name }}" required></div>
+                                    <div class="col-md-6"><label class="form-label fw-bold">Unvan (Title)</label><input type="text" name="title" class="form-control" value="{{ u.title or 'Satış Temsilcisi' }}" required placeholder="Örn: Satış Müdürü, Saha Personeli"></div>
+                                    <div class="col-md-6"><label class="form-label fw-bold">Kurumsal E-Posta</label><input type="email" name="email" class="form-control" value="{{ u.email or '' }}"></div>
+                                    <div class="col-md-6"><label class="form-label fw-bold">E-Posta Şifresi (16 Haneli)</label><input type="password" name="email_pass" class="form-control" value="{{ u.email_pass or '' }}" placeholder="Kendi mailiyle gönderecekse şifre"></div>
+                                    <div class="col-md-6"><label class="form-label fw-bold">Giriş Şifresi Değiştir (İsteğe Bağlı)</label><input type="password" name="new_password" class="form-control" placeholder="Boş bırakılırsa değişmez"></div>
+                                    <div class="col-md-6"><label class="form-label fw-bold">Sistem Rolü</label>
+                                        <select name="role" class="form-select">
+                                            <option value="Personel" {% if u.role == 'Personel' %}selected{% endif %}>Satış Personeli</option>
+                                            <option value="Admin" {% if u.role == 'Admin' %}selected{% endif %}>Yönetici (Admin)</option>
+                                        </select>
+                                    </div>
+                                    <div class="col-md-12">
+                                        <label class="form-label fw-bold text-mim"><i class="fa-solid fa-eye me-1"></i> Görebileceği Menüler (Erişim Yetkisi)</label>
+                                        <div class="p-3 bg-light rounded border">
+                                            <div class="form-check form-check-inline"><input class="form-check-input" type="checkbox" name="menus" value="customers" {% if 'customers' in (u.allowed_menus or '') %}checked{% endif %}> Müşteriler</div>
+                                            <div class="form-check form-check-inline"><input class="form-check-input" type="checkbox" name="menus" value="tasks" {% if 'tasks' in (u.allowed_menus or '') %}checked{% endif %}> Görevler Paneli</div>
+                                            <div class="form-check form-check-inline"><input class="form-check-input" type="checkbox" name="menus" value="dashboard" {% if 'dashboard' in (u.allowed_menus or '') %}checked{% endif %}> Yönetici Raporu</div>
+                                            <div class="form-check form-check-inline"><input class="form-check-input" type="checkbox" name="menus" value="bulk_email" {% if 'bulk_email' in (u.allowed_menus or '') %}checked{% endif %}> Toplu Mail</div>
+                                        </div>
+                                    </div>
+                                    <div class="col-md-12">
+                                        <label class="form-label fw-bold"><i class="fa-solid fa-signature me-1"></i> Otomatik E-Posta İmzası (HTML Destekli)</label>
+                                        <textarea name="email_signature" class="form-control" rows="3" placeholder="Saygılarımla,&#10;Çiğdem Biçer&#10;MİM REKLAM / 0532 ...">{{ u.email_signature or '' }}</textarea>
+                                    </div>
+                                </div>
+                                <div class="modal-footer"><button type="submit" class="btn btn-mim">Kaydet</button></div>
+                            </form>
+                        </div></div></div>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="modal fade" id="addUserModal" tabindex="-1"><div class="modal-dialog modal-lg"><div class="modal-content"><form method="POST" action="/settings/add-user">
+    <div class="modal-header"><h5 class="modal-title text-mim fw-bold">Yeni Personel Tanımla</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
+    <div class="modal-body row g-3">
+        <div class="col-md-6"><label class="form-label fw-bold">Kullanıcı Adı *</label><input type="text" name="username" class="form-control" required placeholder="cigdem"></div>
+        <div class="col-md-6"><label class="form-label fw-bold">Ad Soyad *</label><input type="text" name="full_name" class="form-control" required placeholder="Çiğdem Biçer"></div>
+        <div class="col-md-6"><label class="form-label fw-bold">Unvan (Title) *</label><input type="text" name="title" class="form-control" required value="Satış Temsilcisi"></div>
+        <div class="col-md-6"><label class="form-label fw-bold">Kurumsal E-Posta</label><input type="email" name="email" class="form-control" placeholder="cigdem@mimreklam.com"></div>
+        <div class="col-md-6"><label class="form-label fw-bold">Giriş Şifresi *</label><input type="password" name="password" class="form-control" required placeholder="123456"></div>
+        <div class="col-md-6"><label class="form-label fw-bold">E-Posta Şifresi (16 Haneli)</label><input type="password" name="email_pass" class="form-control" placeholder="xxxx xxxx xxxx xxxx"></div>
+        <div class="col-md-12">
+            <label class="form-label fw-bold text-mim">Erişebileceği Menüler</label>
+            <div class="p-3 bg-light rounded border">
+                <div class="form-check form-check-inline"><input class="form-check-input" type="checkbox" name="menus" value="customers" checked> Müşteriler</div>
+                <div class="form-check form-check-inline"><input class="form-check-input" type="checkbox" name="menus" value="tasks" checked> Görevler Paneli</div>
+                <div class="form-check form-check-inline"><input class="form-check-input" type="checkbox" name="menus" value="dashboard"> Yönetici Raporu</div>
+                <div class="form-check form-check-inline"><input class="form-check-input" type="checkbox" name="menus" value="bulk_email"> Toplu Mail</div>
+            </div>
+        </div>
+        <div class="col-md-12">
+            <label class="form-label fw-bold">Otomatik E-Posta İmzası</label>
+            <textarea name="email_signature" class="form-control" rows="2" placeholder="Saygılarımla, MİM REKLAM"></textarea>
+        </div>
+    </div>
+    <div class="modal-footer"><button type="submit" class="btn btn-mim">Personeli Kaydet</button></div>
+</form></div></div></div>
 """)
 
 DASHBOARD_HTML = BASE_HTML.replace('{% block content %}{% endblock %}', """
 <div class="d-flex justify-content-between align-items-center mb-4 flex-wrap gap-2">
-    <h2><i class="fa-solid fa-chart-pie text-mim me-2"></i>Yönetici Raporu</h2>
+    <h2><i class="fa-solid fa-chart-pie text-mim me-2"></i>Satış & Süreç Yönetici Raporu</h2>
     <a href="/dashboard/export-report?sales_rep={{ filter_rep }}&category={{ filter_cat }}&start_date={{ filter_start }}&end_date={{ filter_end }}" target="_blank" class="btn btn-danger">Raporu Yazdır / PDF</a>
 </div>
 
@@ -854,21 +1120,23 @@ PATRON_REPORT_PDF_HTML = """
 """
 
 BULK_EMAIL_HTML = BASE_HTML.replace('{% block content %}{% endblock %}', """
-<h2 class="mb-4"><i class="fa-brands fa-google text-danger me-2"></i>Gmail Toplu Mail Gönderimi</h2>
+<h2 class="mb-4"><i class="fa-brands fa-google text-danger me-2"></i>Toplu Mail Gönderimi</h2>
 <div class="card card-custom p-4">
     <form method="POST" action="/send-bulk-email" enctype="multipart/form-data">
         <div class="row g-3">
-            <div class="col-md-6"><select name="category" class="form-select"><option value="ALL">Tüm Müşteriler</option>{% for cat in categories %}<option value="{{ cat.name }}">{{ cat.name }}</option>{% endfor %}</select></div>
-            <div class="col-md-6">
+            <div class="col-md-6"><label class="form-label fw-bold">Müşteri Kategorisi</label>
+                <select name="category" class="form-select"><option value="ALL">Tüm Müşteriler</option>{% for cat in categories %}<option value="{{ cat.name }}">{{ cat.name }}</option>{% endfor %}</select>
+            </div>
+            <div class="col-md-6"><label class="form-label fw-bold text-success">Hazır Şablon</label>
                 <select class="form-select" id="templateSelector" onchange="applyTemplate()">
                     <option value="">-- Şablon Seçilmedi --</option>
                     {% for t in templates %}<option value="{{ t.id }}" data-subject="{{ t.subject }}" data-body="{{ t.body }}">{{ t.title }}</option>{% endfor %}
                 </select>
             </div>
-            <div class="col-md-12"><input type="text" name="cc_emails" class="form-control" placeholder="CC (Bilgi E-Postaları)"></div>
-            <div class="col-md-12"><input type="text" name="subject" id="emailSubject" class="form-control" placeholder="Konu" required></div>
-            <div class="col-md-12"><textarea name="body" id="emailBody" class="form-control" rows="6" placeholder="İçerik" required></textarea></div>
-            <div class="col-md-12"><input type="file" name="attachment" class="form-control"></div>
+            <div class="col-md-12"><label class="form-label fw-bold text-mim">CC (Bilgi)</label><input type="text" name="cc_emails" class="form-control" placeholder="patron@mimreklam.com"></div>
+            <div class="col-md-12"><label class="form-label fw-bold">Konu</label><input type="text" name="subject" id="emailSubject" class="form-control" required></div>
+            <div class="col-md-12"><label class="form-label fw-bold">İçerik</label><textarea name="body" id="emailBody" class="form-control" rows="6" required></textarea></div>
+            <div class="col-md-12"><label class="form-label fw-bold text-mim">Dosya / Broşür Ekle</label><input type="file" name="attachment" class="form-control"></div>
             <div class="col-md-12"><button type="submit" class="btn btn-mim btn-lg">Toplu Gönderimi Başlat</button></div>
         </div>
     </form>
@@ -885,86 +1153,41 @@ function applyTemplate() {
 </script>
 """)
 
-SETTINGS_HTML = BASE_HTML.replace('{% block content %}{% endblock %}', """
-<h2 class="mb-4"><i class="fa-solid fa-gears text-mim me-2"></i>Ayarlar</h2>
-<div class="row g-4">
-    <div class="col-md-6">
-        <div class="card card-custom p-4">
-            <h5 class="fw-bold text-mim mb-3">Firma & Teklif Bilgileri</h5>
-            {% if company_logo %}<div class="mb-3 text-center p-2 bg-light rounded"><img src="/uploads/{{ company_logo }}" style="max-height:80px;"></div>{% endif %}
-            <form method="POST" action="/settings/save-company" enctype="multipart/form-data">
-                <div class="mb-2"><input type="file" name="logo" class="form-control form-control-sm" accept="image/*"></div>
-                <div class="mb-2"><input type="text" name="company_name" class="form-control form-control-sm" value="{{ company_name }}" required placeholder="Firma Adı"></div>
-                <div class="mb-2"><input type="text" name="company_address" class="form-control form-control-sm" value="{{ company_address }}" placeholder="Adres"></div>
-                <div class="row g-2 mb-3">
-                    <div class="col-6"><input type="text" name="company_phone" class="form-control form-control-sm" value="{{ company_phone }}" placeholder="Telefon"></div>
-                    <div class="col-6"><input type="email" name="company_email" class="form-control form-control-sm" value="{{ company_email }}" placeholder="E-Posta"></div>
-                </div>
-                <button type="submit" class="btn btn-mim btn-sm">Kaydet</button>
-            </form>
-        </div>
-    </div>
-    <div class="col-md-6">
-        <div class="card card-custom p-4">
-            <h5 class="fw-bold text-danger mb-3">Gmail SMTP</h5>
-            <form method="POST" action="/settings/save-gmail">
-                <div class="mb-3"><input type="email" name="gmail_user" class="form-control" value="{{ gmail_user }}" required placeholder="Gmail Adresi"></div>
-                <div class="mb-3"><input type="password" name="gmail_pass" class="form-control" value="{{ gmail_pass }}" required placeholder="16 Haneli Şifre"></div>
-                <button type="submit" class="btn btn-danger btn-sm">Kaydet</button>
-            </form>
-        </div>
-    </div>
-    <div class="col-md-6">
-        <div class="card card-custom p-4">
-            <h5 class="fw-bold text-mim mb-3">Kategoriler</h5>
-            <form method="POST" action="/settings/add-category" class="row g-2 mb-3">
-                <div class="col-8"><input type="text" name="category_name" class="form-control form-control-sm" placeholder="Kategori" required></div>
-                <div class="col-4"><button type="submit" class="btn btn-mim btn-sm w-100">Ekle</button></div>
-            </form>
-            <ul class="list-group">
-                {% for cat in categories %}<li class="list-group-item d-flex justify-content-between align-items-center py-2">{{ cat.name }}<a href="/settings/delete-category/{{ cat.id }}" class="btn btn-sm btn-outline-danger">Sil</a></li>{% endfor %}
-            </ul>
-        </div>
-    </div>
-    <div class="col-md-6">
-        <div class="card card-custom p-4">
-            <div class="d-flex justify-content-between align-items-center mb-3"><h5 class="fw-bold text-mim">Hazır Şablonlar</h5><button class="btn btn-sm btn-mim" data-bs-toggle="modal" data-bs-target="#addTplModal">+ Ekle</button></div>
-            <ul class="list-group">
-                {% for t in templates %}<li class="list-group-item d-flex justify-content-between align-items-center py-2"><div><strong>{{ t.title }}</strong></div><a href="/settings/delete-template/{{ t.id }}" class="btn btn-sm btn-outline-danger">Sil</a></li>{% endfor %}
-            </ul>
-        </div>
-    </div>
-    <div class="col-md-12">
-        <div class="card card-custom p-4">
-            <div class="d-flex justify-content-between align-items-center mb-3"><h5 class="fw-bold">Personel Hesapları</h5><button class="btn btn-sm btn-mim" data-bs-toggle="modal" data-bs-target="#addUserModal">+ Personel Ekle</button></div>
-            <table class="table">
-                <thead><tr><th>Kullanıcı</th><th>Ad Soyad</th><th>E-Posta</th><th>Yetki</th><th>İşlem</th></tr></thead>
-                <tbody>
-                    {% for u in users %}
-                    <tr><td>{{ u.username }}</td><td>{{ u.full_name }}</td><td>{{ u.email or '-' }}</td><td>{{ u.role }}</td><td>{% if u.username != 'admin' %}<a href="/settings/delete-user/{{ u.id }}" class="btn btn-sm btn-outline-danger">Sil</a>{% endif %}</td></tr>
-                    {% endfor %}
-                </tbody>
-            </table>
-        </div>
-    </div>
-</div>
-<div class="modal fade" id="addTplModal" tabindex="-1"><div class="modal-dialog"><div class="modal-content"><form method="POST" action="/settings/add-template"><div class="modal-header"><h5 class="modal-title">Şablon</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div><div class="modal-body row g-3"><div class="col-md-12"><input type="text" name="title" class="form-control" placeholder="Başlık" required></div><div class="col-md-12"><input type="text" name="subject" class="form-control" placeholder="Konu" required></div><div class="col-md-12"><textarea name="body" class="form-control" rows="4" placeholder="İçerik" required></textarea></div></div><div class="modal-footer"><button type="submit" class="btn btn-mim">Kaydet</button></div></form></div></div></div>
-<div class="modal fade" id="addUserModal" tabindex="-1"><div class="modal-dialog"><div class="modal-content"><form method="POST" action="/settings/add-user"><div class="modal-header"><h5 class="modal-title">Personel</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div><div class="modal-body row g-3"><div class="col-md-6"><input type="text" name="username" class="form-control" placeholder="Kullanıcı Adı" required></div><div class="col-md-6"><input type="text" name="full_name" class="form-control" placeholder="Ad Soyad" required></div><div class="col-md-6"><input type="email" name="email" class="form-control" placeholder="E-Posta" required></div><div class="col-md-6"><input type="password" name="password" class="form-control" placeholder="Şifre" required></div><div class="col-md-12"><select name="role" class="form-select"><option value="Personel">Personel</option><option value="Admin">Admin</option></select></div></div><div class="modal-footer"><button type="submit" class="btn btn-mim">Kaydet</button></div></form></div></div></div>
-""")
-
 # -----------------------------------------------------------------------------
-# FLASK CONTROLLER ROTALARI
+# FLASK ROUTE VE API CONTROLLERS
 # -----------------------------------------------------------------------------
 
 @app.route('/uploads/<filename>')
 def uploaded_file(filename):
-    if not session.get('user_id'):
-        return redirect(url_for('login'))
     return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
+
+# 30 Dakika Önceden Randevu Kontrol API'si
+@app.route('/api/upcoming-meetings')
+def api_upcoming_meetings():
+    now = datetime.now()
+    threshold = now + timedelta(minutes=30)
+    
+    # 30 dk içinde ve henüz saati geçmemiş randevuları bul
+    meetings = Interaction.query.filter(
+        Interaction.planned_datetime != None,
+        Interaction.planned_datetime >= now,
+        Interaction.planned_datetime <= threshold
+    ).all()
+
+    res = []
+    for m in meetings:
+        c = Customer.query.get(m.customer_id)
+        diff_minutes = int((m.planned_datetime - now).total_seconds() / 60)
+        res.append({
+            'customer_name': c.company_name if c else 'Müşteri',
+            'time': m.planned_datetime.strftime('%H:%M'),
+            'minutes_left': diff_minutes
+        })
+    return jsonify(res)
 
 @app.before_request
 def check_auth():
-    allowed = ['login', 'static', 'pwa_manifest', 'service_worker']
+    allowed = ['login', 'static', 'uploaded_file', 'download_file', 'api_upcoming_meetings']
     if not session.get('user_id') and request.endpoint not in allowed:
         return redirect(url_for('login'))
 
@@ -976,7 +1199,9 @@ def login():
             session['user_id'] = user.id
             session['username'] = user.username
             session['full_name'] = user.full_name
+            session['title'] = user.title or 'Satış Temsilcisi'
             session['role'] = user.role
+            session['allowed_menus'] = user.allowed_menus or ''
             flash(f'Hoş geldiniz, {user.full_name}', 'success')
             return redirect(url_for('index'))
         flash('Hatalı kullanıcı adı veya şifre!', 'danger')
@@ -993,7 +1218,7 @@ def index():
     f_cat = request.args.get('category', 'ALL')
     q = Customer.query
     if s_query:
-        q = q.filter((Customer.company_name.contains(s_query)) | (Customer.contact_person.contains(s_query)) | (Customer.tax_number.contains(s_query)))
+        q = q.filter((Customer.company_name.contains(s_query)) | (Customer.contact_person.contains(s_query)) | (Customer.trade_registry_no.contains(s_query)) | (Customer.phone.contains(s_query)))
     if f_cat != 'ALL':
         q = q.filter(Customer.category == f_cat)
     customers = q.order_by(Customer.id.desc()).all()
@@ -1003,16 +1228,16 @@ def index():
 def add_customer():
     c = Customer(
         company_name=request.form['company_name'],
-        contact_person=request.form['contact_person'],
+        trade_registry_no=request.form.get('trade_registry_no'),
+        contact_person=request.form.get('contact_person'),
         email=request.form['email'],
         phone=request.form['phone'],
+        address=request.form.get('address'),
         tax_office=request.form.get('tax_office'),
         tax_number=request.form.get('tax_number'),
         category=request.form.get('category', 'Genel'),
-        assigned_sales_rep=request.form.get('assigned_sales_rep', 'Çiğdem Biçer'),
-        payment_terms=request.form.get('payment_terms'),
-        credit_limit=float(request.form.get('credit_limit', 0) or 0),
-        address=request.form.get('address')
+        assigned_sales_rep=session.get('full_name', 'Çiğdem Biçer'),
+        payment_terms=request.form.get('payment_terms')
     )
     db.session.add(c)
     db.session.commit()
@@ -1023,15 +1248,14 @@ def add_customer():
 def edit_customer(id):
     c = Customer.query.get_or_404(id)
     c.company_name = request.form['company_name']
-    c.contact_person = request.form['contact_person']
+    c.trade_registry_no = request.form.get('trade_registry_no')
+    c.contact_person = request.form.get('contact_person')
     c.email = request.form['email']
     c.phone = request.form['phone']
     c.tax_office = request.form.get('tax_office')
     c.tax_number = request.form.get('tax_number')
     c.category = request.form.get('category')
-    c.assigned_sales_rep = request.form.get('assigned_sales_rep')
     c.payment_terms = request.form.get('payment_terms')
-    c.credit_limit = float(request.form.get('credit_limit', 0) or 0)
     c.address = request.form.get('address')
     db.session.commit()
     flash('Müşteri güncellendi.', 'success')
@@ -1062,6 +1286,248 @@ def customer_detail(id):
     production_issues = [{'job_title': (SalesAndPayment.query.get(pi.sale_id).job_title if pi.sale_id else 'Genel Sipariş'), 'issue_description': pi.issue_description, 'sales_notes': pi.sales_notes, 'status': pi.status} for pi in raw_issues]
     return render_template_string(CUSTOMER_DETAIL_HTML, customer=customer, proposals=proposals, interactions=interactions, documents=documents, sales=sales, production_issues=production_issues)
 
+# GÖRÜŞME & İLERİ TARİHLİ RANDEVU EKLEME
+@app.route('/customer/<int:id>/add-interaction', methods=['POST'])
+def add_interaction(id):
+    p_str = request.form.get('planned_datetime')
+    planned_dt = None
+    if p_str:
+        try:
+            planned_dt = datetime.strptime(p_str, '%Y-%m-%dT%H:%M')
+        except Exception:
+            pass
+
+    inter = Interaction(
+        customer_id=id,
+        sales_rep=request.form['sales_rep'],
+        location=request.form.get('location'),
+        planned_datetime=planned_dt,
+        customer_feedback=request.form.get('customer_feedback'),
+        notes=request.form.get('notes'),
+        result=request.form.get('result')
+    )
+    db.session.add(inter)
+    db.session.commit()
+    flash('Görüşme ve randevu planı kaydedildi. 30 dk kala sistem sizi uyaracaktır.', 'success')
+    return redirect(url_for('customer_detail', id=id))
+
+# GÖREV DÜZENLEME VE SİLME
+@app.route('/task/edit/<int:id>', methods=['POST'])
+def edit_task(id):
+    t = Task.query.get_or_404(id)
+    t.title = request.form['title'].strip()
+    t.description = request.form.get('description')
+    t.assigned_to = request.form['assigned_to'].strip()
+    cust_id = request.form.get('customer_id')
+    t.customer_id = int(cust_id) if cust_id else None
+    due_str = request.form.get('due_date')
+    if due_str:
+        t.due_date = datetime.strptime(due_str, '%Y-%m-%d')
+    t.priority = request.form.get('priority', 'Normal')
+    db.session.commit()
+    flash('Görev başarıyla güncellendi.', 'success')
+    return redirect(url_for('tasks'))
+
+@app.route('/task/delete/<int:id>')
+def delete_task(id):
+    t = Task.query.get_or_404(id)
+    db.session.delete(t)
+    db.session.commit()
+    flash('Görev silindi.', 'info')
+    return redirect(url_for('tasks'))
+
+@app.route('/tasks')
+def tasks():
+    view_type = request.args.get('view', 'my')
+    curr_user = session.get('full_name', '').strip()
+    raw_tasks = Task.query.order_by(Task.due_date.asc()).all() if view_type == 'all' else Task.query.filter(Task.assigned_to == curr_user).order_by(Task.due_date.asc()).all()
+    tasks_list = []
+    for t in raw_tasks:
+        c = Customer.query.get(t.customer_id) if t.customer_id else None
+        tasks_list.append({
+            'id': t.id,
+            'title': t.title,
+            'description': t.description,
+            'assigned_by': t.assigned_by,
+            'assigned_to': t.assigned_to,
+            'customer_name': c.company_name if c else 'Genel Görev',
+            'customer_id': t.customer_id,
+            'due_date': t.due_date,
+            'priority': t.priority,
+            'status': t.status,
+            'reason': t.reason
+        })
+    return render_template_string(TASKS_HTML, tasks=tasks_list, view_type=view_type, users=User.query.all(), customers=Customer.query.all())
+
+@app.route('/task/add', methods=['POST'])
+def add_task():
+    try:
+        cust_id = request.form.get('customer_id')
+        due_str = request.form.get('due_date')
+        customer_id_val = int(cust_id) if (cust_id and cust_id.strip() != '') else None
+        due_date_val = datetime.strptime(due_str, '%Y-%m-%d') if due_str else datetime.now()
+        t = Task(
+            title=request.form['title'].strip(),
+            description=request.form.get('description'),
+            assigned_by=session.get('full_name'),
+            assigned_to=request.form['assigned_to'].strip(),
+            customer_id=customer_id_val,
+            due_date=due_date_val,
+            priority=request.form.get('priority', 'Normal')
+        )
+        db.session.add(t)
+        db.session.commit()
+        flash('Görev atandı.', 'success')
+    except Exception as e:
+        db.session.rollback()
+        flash(f'Hata: {str(e)}', 'danger')
+    return redirect(url_for('tasks'))
+
+@app.route('/task/update/<int:id>', methods=['POST'])
+def update_task(id):
+    t = Task.query.get_or_404(id)
+    t.status = request.form['status']
+    t.reason = request.form.get('reason') if t.status == 'Tamamlanamadı' else None
+    db.session.commit()
+    flash('Görev durumu güncellendi.', 'success')
+    return redirect(url_for('tasks'))
+
+# PERSONEL BAZLI MAİL GÖNDERİMİ (İMZALI)
+@app.route('/proposal/<int:p_id>/send-email', methods=['POST'])
+def send_proposal_email(p_id):
+    proposal = Proposal.query.get_or_404(p_id)
+    customer = Customer.query.get(proposal.customer_id)
+    to_email = request.form.get('to_email')
+    cc_emails = request.form.get('cc_emails')
+    extra_note = request.form.get('extra_note', '')
+
+    body = f"""
+    <h3>Sayın {customer.contact_person or customer.company_name},</h3>
+    <p>Firmanıza özel hazırlanan <strong>{proposal.code} - {proposal.title}</strong> teklifimiz sunulmuştur.</p>
+    <p><strong>Toplam Tutar:</strong> {proposal.total_amount:,.2f} TL</p>
+    <p style='background:#fbeff7; padding:10px; border-left:4px solid #701658;'>{extra_note}</p>
+    """
+    success, msg = send_custom_mail(session.get('user_id'), to_email, f"Teklif: {proposal.code} - {proposal.title}", body, cc_emails=cc_emails)
+    flash(f'Teklif e-postası {to_email} adresine iletildi.' if success else f'Mail hatası: {msg}', 'success' if success else 'danger')
+    return redirect(url_for('customer_detail', id=customer.id))
+
+@app.route('/send-bulk-email', methods=['POST'])
+def send_bulk_email():
+    cat = request.form.get('category')
+    subject = request.form.get('subject')
+    body = request.form.get('body')
+    cc_emails = request.form.get('cc_emails')
+    attachment_path = None
+    file = request.files.get('attachment')
+    if file and file.filename:
+        filename = secure_filename(file.filename)
+        attachment_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        file.save(attachment_path)
+
+    targets = Customer.query.all() if cat == 'ALL' else Customer.query.filter_by(category=cat).all()
+    sent_count = 0
+    for c in targets:
+        if c.email and isinstance(c.email, str) and '@' in c.email:
+            success, _ = send_custom_mail(session.get('user_id'), c.email.strip(), subject, f"<p>Sayın {c.company_name},</p>{body}", attachment_path, cc_emails=cc_emails)
+            if success: sent_count += 1
+            time.sleep(1)
+
+    flash(f'Toplu e-posta tamamlandı! {sent_count} müşteriye mail başarıyla iletildi.', 'success')
+    return redirect(url_for('bulk_email'))
+
+# PERSONEL AYARLARI (TITLE, İMZA, MENÜLER)
+@app.route('/settings/edit-user/<int:id>', methods=['POST'])
+def edit_user(id):
+    u = User.query.get_or_404(id)
+    u.full_name = request.form['full_name'].strip()
+    u.title = request.form['title'].strip()
+    u.email = request.form.get('email', '').strip()
+    u.email_pass = request.form.get('email_pass', '').strip()
+    u.email_signature = request.form.get('email_signature', '')
+    u.role = request.form['role']
+
+    # Menü seçimlerini birleştir
+    selected_menus = request.form.getlist('menus')
+    u.allowed_menus = ",".join(selected_menus)
+
+    new_pass = request.form.get('new_password')
+    if new_pass and new_pass.strip():
+        u.password_hash = generate_password_hash(new_pass.strip())
+
+    db.session.commit()
+    flash(f'{u.full_name} kullanıcısının ayarları, unvanı ve yetkileri güncellendi.', 'success')
+    return redirect(url_for('settings'))
+
+@app.route('/settings/add-user', methods=['POST'])
+def add_user():
+    selected_menus = request.form.getlist('menus')
+    u = User(
+        username=request.form['username'].strip(),
+        full_name=request.form['full_name'].strip(),
+        title=request.form['title'].strip(),
+        email=request.form.get('email', '').strip(),
+        email_pass=request.form.get('email_pass', '').strip(),
+        email_signature=request.form.get('email_signature', ''),
+        allowed_menus=",".join(selected_menus),
+        password_hash=generate_password_hash(request.form['password']),
+        role='Personel'
+    )
+    db.session.add(u)
+    db.session.commit()
+    flash('Yeni personel tanımlandı.', 'success')
+    return redirect(url_for('settings'))
+
+# --- EXCEL YENİLENEN ŞABLON VE IMPORT (Ticaret Sicil No, Unvan, Adres, Firma Tel, Firma Mail) ---
+@app.route('/download-template')
+def download_template():
+    df = pd.DataFrame(columns=[
+        'Ticaret Sicil No',
+        'Unvan',
+        'Adres',
+        'Firma Tel',
+        'Firma Mail',
+        'Yetkili',
+        'Kategori',
+        'Vergi Dairesi',
+        'Vergi No',
+        'Ödeme Vadesi'
+    ])
+    filepath = os.path.join(UPLOAD_FOLDER, 'Musteri_Yukleme_Sablonu.xlsx')
+    df.to_excel(filepath, index=False)
+    return send_file(filepath, as_attachment=True)
+
+@app.route('/import-excel', methods=['POST'])
+def import_excel():
+    file = request.files.get('file')
+    if file:
+        df = pd.read_excel(file)
+        success_count = 0
+        for _, row in df.iterrows():
+            unvan = row.get('Unvan') or row.get('Firma Adı')
+            tel = row.get('Firma Tel') or row.get('Telefon')
+            mail = row.get('Firma Mail') or row.get('E-Posta')
+
+            if pd.notnull(unvan) and pd.notnull(tel) and pd.notnull(mail):
+                c = Customer(
+                    trade_registry_no=str(row.get('Ticaret Sicil No', '')) if pd.notnull(row.get('Ticaret Sicil No')) else '',
+                    company_name=str(unvan).strip(),
+                    address=str(row.get('Adres', '')) if pd.notnull(row.get('Adres')) else '',
+                    phone=str(tel).strip(),
+                    email=str(mail).strip(),
+                    contact_person=str(row.get('Yetkili', '')) if pd.notnull(row.get('Yetkili')) else '',
+                    category=str(row.get('Kategori', 'Genel')) if pd.notnull(row.get('Kategori')) else 'Genel',
+                    tax_office=str(row.get('Vergi Dairesi', '')) if pd.notnull(row.get('Vergi Dairesi')) else '',
+                    tax_number=str(row.get('Vergi No', '')) if pd.notnull(row.get('Vergi No')) else '',
+                    payment_terms=str(row.get('Ödeme Vadesi', '')) if pd.notnull(row.get('Ödeme Vadesi')) else '',
+                    assigned_sales_rep=session.get('full_name', 'Çiğdem Biçer')
+                )
+                db.session.add(c)
+                success_count += 1
+        db.session.commit()
+        flash(f'{success_count} müşteri yeni şablon ile başarıyla yüklendi.', 'success')
+    return redirect(url_for('index'))
+
+# DİĞER STANDART ROTALAR
 @app.route('/customer/<int:id>/add-proposal', methods=['POST'])
 def add_proposal(id):
     item_names = request.form.getlist('item_name[]')
@@ -1149,88 +1615,6 @@ def view_proposal(p_id):
         company_phone=c_phone.value if c_phone else '',
         company_email=c_email.value if c_email else ''
     )
-
-@app.route('/proposal/<int:p_id>/send-email', methods=['POST'])
-def send_proposal_email(p_id):
-    proposal = Proposal.query.get_or_404(p_id)
-    customer = Customer.query.get(proposal.customer_id)
-    to_email = request.form.get('to_email')
-    cc_emails = request.form.get('cc_emails')
-    extra_note = request.form.get('extra_note', '')
-
-    body = f"""
-    <h3>Sayın {customer.contact_person or customer.company_name},</h3>
-    <p>Firmanıza özel hazırlanan <strong>{proposal.code} - {proposal.title}</strong> teklifimiz sunulmuştur.</p>
-    <p><strong>Toplam Tutar:</strong> {proposal.total_amount:,.2f} TL</p>
-    <p style='background:#fbeff7; padding:10px; border-left:4px solid #701658;'>{extra_note}</p>
-    <br><small>MİM REKLAM Kurumsal Satış</small>
-    """
-    success, msg = send_gmail_with_attachment(to_email, f"Teklif: {proposal.code} - {proposal.title}", body, cc_emails=cc_emails)
-    flash(f'Teklif {to_email} adresine iletildi.' if success else f'Mail hatası: {msg}', 'success' if success else 'danger')
-    return redirect(url_for('customer_detail', id=customer.id))
-
-@app.route('/tasks')
-def tasks():
-    view_type = request.args.get('view', 'my')
-    curr_user = session.get('full_name', '').strip()
-    raw_tasks = Task.query.order_by(Task.due_date.asc()).all() if view_type == 'all' else Task.query.filter(Task.assigned_to == curr_user).order_by(Task.due_date.asc()).all()
-    tasks_list = []
-    for t in raw_tasks:
-        c = Customer.query.get(t.customer_id) if t.customer_id else None
-        tasks_list.append({
-            'id': t.id,
-            'title': t.title,
-            'description': t.description,
-            'assigned_by': t.assigned_by,
-            'assigned_to': t.assigned_to,
-            'customer_name': c.company_name if c else 'Genel Görev',
-            'due_date': t.due_date,
-            'priority': t.priority,
-            'status': t.status,
-            'reason': t.reason
-        })
-    return render_template_string(TASKS_HTML, tasks=tasks_list, view_type=view_type, users=User.query.all(), customers=Customer.query.all())
-
-@app.route('/task/add', methods=['POST'])
-def add_task():
-    try:
-        cust_id = request.form.get('customer_id')
-        due_str = request.form.get('due_date')
-        customer_id_val = int(cust_id) if (cust_id and cust_id.strip() != '') else None
-        due_date_val = datetime.strptime(due_str, '%Y-%m-%d') if due_str else datetime.now()
-        t = Task(
-            title=request.form['title'].strip(),
-            description=request.form.get('description'),
-            assigned_by=session.get('full_name'),
-            assigned_to=request.form['assigned_to'].strip(),
-            customer_id=customer_id_val,
-            due_date=due_date_val,
-            priority=request.form.get('priority', 'Normal')
-        )
-        db.session.add(t)
-        db.session.commit()
-        flash('Görev başarıyla atandı.', 'success')
-    except Exception as e:
-        db.session.rollback()
-        flash(f'Hata: {str(e)}', 'danger')
-    return redirect(url_for('tasks'))
-
-@app.route('/task/update/<int:id>', methods=['POST'])
-def update_task(id):
-    t = Task.query.get_or_404(id)
-    t.status = request.form['status']
-    t.reason = request.form.get('reason') if t.status == 'Tamamlanamadı' else None
-    db.session.commit()
-    flash('Görev güncellendi.', 'success')
-    return redirect(url_for('tasks'))
-
-@app.route('/customer/<int:id>/add-interaction', methods=['POST'])
-def add_interaction(id):
-    inter = Interaction(customer_id=id, sales_rep=request.form['sales_rep'], location=request.form.get('location'), customer_feedback=request.form.get('customer_feedback'), notes=request.form.get('notes'), result=request.form.get('result'))
-    db.session.add(inter)
-    db.session.commit()
-    flash('Görüşme notu eklendi.', 'success')
-    return redirect(url_for('customer_detail', id=id))
 
 @app.route('/customer/<int:id>/upload-doc', methods=['POST'])
 def upload_doc(id):
@@ -1335,30 +1719,6 @@ def export_report():
 def bulk_email():
     return render_template_string(BULK_EMAIL_HTML, categories=CustomerCategory.query.all(), templates=EmailTemplate.query.all())
 
-@app.route('/send-bulk-email', methods=['POST'])
-def send_bulk_email():
-    cat = request.form.get('category')
-    subject = request.form.get('subject')
-    body = request.form.get('body')
-    cc_emails = request.form.get('cc_emails')
-    attachment_path = None
-    file = request.files.get('attachment')
-    if file and file.filename:
-        filename = secure_filename(file.filename)
-        attachment_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-        file.save(attachment_path)
-
-    targets = Customer.query.all() if cat == 'ALL' else Customer.query.filter_by(category=cat).all()
-    sent_count = 0
-    for c in targets:
-        if c.email and isinstance(c.email, str) and '@' in c.email:
-            success, _ = send_gmail_with_attachment(c.email.strip(), subject, f"<p>Sayın {c.company_name},</p>{body}", attachment_path, cc_emails=cc_emails)
-            if success: sent_count += 1
-            time.sleep(1)
-
-    flash(f'Toplu e-posta tamamlandı! {sent_count} müşteriye iletildi.', 'success')
-    return redirect(url_for('bulk_email'))
-
 @app.route('/settings')
 def settings():
     if session.get('role') != 'Admin': return redirect(url_for('index'))
@@ -1390,6 +1750,7 @@ def save_company():
     c_addr = SystemSetting.query.filter_by(key='COMPANY_ADDR').first() or SystemSetting(key='COMPANY_ADDR')
     c_phone = SystemSetting.query.filter_by(key='COMPANY_PHONE').first() or SystemSetting(key='COMPANY_PHONE')
     c_email = SystemSetting.query.filter_by(key='COMPANY_EMAIL').first() or SystemSetting(key='COMPANY_EMAIL')
+
     c_name.value = request.form['company_name']
     c_addr.value = request.form['company_address']
     c_phone.value = request.form['company_phone']
@@ -1415,43 +1776,7 @@ def save_gmail():
     u.value, p.value = request.form['gmail_user'], request.form['gmail_pass']
     db.session.add_all([u, p])
     db.session.commit()
-    flash('Gmail kaydedildi.', 'success')
-    return redirect(url_for('settings'))
-
-@app.route('/settings/add-category', methods=['POST'])
-def add_category():
-    cat = CustomerCategory(name=request.form['category_name'].strip())
-    db.session.add(cat)
-    db.session.commit()
-    flash('Kategori eklendi.', 'success')
-    return redirect(url_for('settings'))
-
-@app.route('/settings/delete-category/<int:id>')
-def delete_category(id):
-    db.session.delete(CustomerCategory.query.get_or_404(id))
-    db.session.commit()
-    return redirect(url_for('settings'))
-
-@app.route('/settings/add-template', methods=['POST'])
-def add_template():
-    t = EmailTemplate(title=request.form['title'], subject=request.form['subject'], body=request.form['body'])
-    db.session.add(t)
-    db.session.commit()
-    flash('Şablon eklendi.', 'success')
-    return redirect(url_for('settings'))
-
-@app.route('/settings/delete-template/<int:id>')
-def delete_template(id):
-    db.session.delete(EmailTemplate.query.get_or_404(id))
-    db.session.commit()
-    return redirect(url_for('settings'))
-
-@app.route('/settings/add-user', methods=['POST'])
-def add_user():
-    u = User(username=request.form['username'].strip(), full_name=request.form['full_name'].strip(), email=request.form['email'].strip(), password_hash=generate_password_hash(request.form['password']), role=request.form['role'])
-    db.session.add(u)
-    db.session.commit()
-    flash('Personel eklendi.', 'success')
+    flash('Gmail ayarları kaydedildi.', 'success')
     return redirect(url_for('settings'))
 
 @app.route('/settings/delete-user/<int:id>')
@@ -1460,69 +1785,30 @@ def delete_user(id):
     db.session.commit()
     return redirect(url_for('settings'))
 
-@app.route('/download-template')
-def download_template():
-    cats = [c.name for c in CustomerCategory.query.all()]
-    cat_str = ", ".join(cats) if cats else "Genel, VIP, Aktif"
-    df = pd.DataFrame(columns=['Firma Adı (Zorunlu)', 'Yetkili Ad Soyad (Zorunlu)', 'E-Posta (Zorunlu)', 'Telefon (Zorunlu)', 'Kategori (' + cat_str + ')', 'Sorumlu Satıcı', 'Vergi Dairesi', 'Vergi No', 'Ödeme Vadesi', 'Kredi Limiti', 'Adres'])
-    filepath = os.path.join(UPLOAD_FOLDER, 'Musteri_Yukleme_Sablonu.xlsx')
-    df.to_excel(filepath, index=False)
-    return send_file(filepath, as_attachment=True)
-
-@app.route('/import-excel', methods=['POST'])
-def import_excel():
-    file = request.files.get('file')
-    if file:
-        df = pd.read_excel(file)
-        success_count = 0
-        for _, row in df.iterrows():
-            c_name = row.get('Firma Adı (Zorunlu)') or row.get('Firma Adı')
-            c_person = row.get('Yetkili Ad Soyad (Zorunlu)') or row.get('Yetkili')
-            c_email = row.get('E-Posta (Zorunlu)') or row.get('E-Posta')
-            c_phone = row.get('Telefon (Zorunlu)') or row.get('Telefon')
-
-            if pd.notnull(c_name) and pd.notnull(c_person) and pd.notnull(c_email) and pd.notnull(c_phone):
-                cat_val = 'Genel'
-                for col in row.index:
-                    if 'Kategori' in str(col) and pd.notnull(row[col]):
-                        cat_val = str(row[col]).strip()
-                        break
-                c = Customer(
-                    company_name=str(c_name).strip(),
-                    contact_person=str(c_person).strip(),
-                    email=str(c_email).strip(),
-                    phone=str(c_phone).strip(),
-                    category=cat_val,
-                    assigned_sales_rep=str(row.get('Sorumlu Satıcı', 'Çiğdem Biçer')),
-                    tax_office=str(row.get('Vergi Dairesi', '')) if pd.notnull(row.get('Vergi Dairesi')) else '',
-                    tax_number=str(row.get('Vergi No', '')) if pd.notnull(row.get('Vergi No')) else '',
-                    payment_terms=str(row.get('Ödeme Vadesi', '')) if pd.notnull(row.get('Ödeme Vadesi')) else '',
-                    credit_limit=float(row.get('Kredi Limiti', 0)) if pd.notnull(row.get('Kredi Limiti')) else 0.0,
-                    address=str(row.get('Adres', '')) if pd.notnull(row.get('Adres')) else ''
-                )
-                db.session.add(c)
-                success_count += 1
-        db.session.commit()
-        flash(f'{success_count} müşteri yüklendi.', 'success')
-    return redirect(url_for('index'))
-
 # -----------------------------------------------------------------------------
-# Production initialization. Existing database is preserved.
+# BAŞLATMA
 # -----------------------------------------------------------------------------
+
 def init_system():
+    # Preflight and migration run in the container entrypoint before this function.
     with app.app_context():
         db.create_all()
         if User.query.count() == 0:
             password = os.getenv('ADMIN_INITIAL_PASSWORD')
             if not password or len(password) < 12:
-                raise RuntimeError('New database requires ADMIN_INITIAL_PASSWORD (12+ characters)')
-            db.session.add(User(
+                raise RuntimeError('Initial admin requires ADMIN_INITIAL_PASSWORD (12+ characters)')
+            admin = User(
                 username='admin',
                 full_name='Sistem Yöneticisi',
+                title='Genel Müdür',
                 email='admin@mimreklam.com',
+                allowed_menus='customers,tasks,dashboard,bulk_email',
                 password_hash=generate_password_hash(password),
                 role='Admin'
-            ))
+            )
+            db.session.add(admin)
+            if CustomerCategory.query.count() == 0:
+                db.session.add_all([CustomerCategory(name=x) for x in ('VIP Müşteri', 'Aktif Müşteri', 'Potansiyel')])
             db.session.commit()
 
 if __name__ == '__main__':

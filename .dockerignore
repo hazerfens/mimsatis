@@ -1,5 +1,7 @@
+__pycache__
+*.pyc
 *.db
 *.sqlite*
-__pycache__/
 .env
+.git
 uploaded_files/
