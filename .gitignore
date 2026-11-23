@@ -1,0 +1,8 @@
+.venv/
+.local-preview/
+.local-tests/
+__pycache__/
+*.pyc
+*.db
+*.sqlite*
+.env

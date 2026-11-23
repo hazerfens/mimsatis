@@ -1,11 +1,17 @@
-# Mim Satış — SQLite verisini koruyarak güncelleme
+# Mim Satış CRM güncellemesi
 
-1. SQLite veritabanını ve uploads dizinini ayrıca yedekleyin. Uygulamayı güncelleme sırasında durdurun veya yazma trafiğini kesin.
-2. Coolify kalıcı mount'lar: `/srv/mim-satis/data` -> `/app/data` ve `/srv/mim-satis/uploads` -> `/app/uploaded_files`. Var olan SQLite dosyasının `/srv/mim-satis/data/mim_reklam_satis_sistemi.db` konumunda olduğundan emin olun.
-3. Coolify ortamında `SECRET_KEY` (önceki kurulumla **aynı** değer), `DATABASE_PATH=/app/data/mim_reklam_satis_sistemi.db`, `UPLOAD_FOLDER=/app/uploaded_files`, `REQUIRE_EXISTING_DB=1` ayarlarını koruyun. `ADMIN_INITIAL_PASSWORD` yalnızca yeni/verisiz kurulum için gerekir.
-4. Git deposunda dosyaları güncelleyin ve deploy edin. Başlangıç komutu mevcut DB'yi arar, eksik altı sütun için SQLite backup alır ve `ALTER TABLE ADD COLUMN` uygular. DB yoksa boş DB açmadan çıkar.
-5. Logs'ta `SQLite backup created` ve `Schema updated` mesajlarını kontrol edin. Eski kayıtların açıldığını, kullanıcı girişini, müşteri, teklif, randevu, Excel ve e-posta işlemlerini test edin.
+Coolify kalıcı disk bağlantıları `/srv/mim-satis/data` → `/app/data` ve `/srv/mim-satis/uploads` → `/app/uploaded_files` olarak devam etmelidir. Üretim dosyası `DATABASE_PATH=/app/data/mim_reklam_satis_sistemi.db` ile seçilir. `SECRET_KEY` mevcut değeriyle korunmalıdır. `REQUIRE_EXISTING_DB=1` dosya bulunamadığında başlangıcı durdurur.
 
-Eklenen sütunlar: user.title, user.email_pass, user.email_signature, user.allowed_menus, customer.trade_registry_no, interaction.planned_datetime. Mevcut tablolardaki kayıtlar silinmez. SQLite üzerinde yeni sütunların eklenmesi dosyayı teknik olarak değiştirdiğinden 'DB değişmeden' ifadesi **veriler korunarak şema yükseltmesi** anlamındadır.
+Deploy sırasında eski uygulamanın yazma trafiğini durdurun. Aynı SQLite dosyasına eski ve yeni sürümü birlikte yazdırmayın. Veritabanı ve yüklenen dosyalar için ayrıca sunucu yedeği alın.
 
-Önemli: yeni sürüm eskisindeki PWA manifest ve service worker endpoint'lerini içermiyor; PWA kullanımı sürdürülmek isteniyorsa ayrıca geri eklenmelidir. Personel SMTP şifreleri bu sürümde veritabanında düz metin olarak tutuluyor; ayrıca güvenlik iyileştirmesi gerekir.
+Docker başlangıcı `python migrate_sqlite.py` çalıştırır. Geçiş, veritabanının SQLite backup API ile tutarlı kopyasını aynı veri klasöründeki `backups/` altında oluşturur. Yeni şema, kayıt aktarımı ve geçiş işareti tek transaction içinde tamamlanır. Hata durumunda transaction geri alınır ve web sunucusu başlamaz.
+
+Eski customer, interaction, proposal, task, user ve email_template kayıtları yeni customers, interactions, quotes, tasks, staff ve mail_templates tablolarına kimlikleri korunarak aktarılır. Eski sütunlar yeni tablolarda da tutulur. Görev tarih ve saati ayrılır, teklif kalemleri yeni arayüz biçimine çevrilir. Firma ayarları aktarılır. Mevcut kullanıcı adları ve parola hashleri giriş için korunur. SMTP parolaları bootstrap API yanıtına dahil edilmez.
+
+Eski tabloların tamamı veritabanında tutulur. Belgeler, satış/ödeme, üretim kayıtları ve eski sistem ayarları da bu kapsamdadır. Yeni arayüzde bu eski modüllerin karşılığı bulunmadığından bu kayıtlara arayüz erişimi ayrıca geliştirilmelidir. Yüklenen dosyalar mevcut uploads diskinde kalır. Yeni uygulama eski tabloları güncel tutmaz. Geri dönüş gerektiğinde deploy öncesi yedek ve o tarihten sonraki yeni kayıtlar birlikte değerlendirilmelidir.
+
+Başarılı geçiş `crm_migrations` tablosunda işaretlenir. Sonraki deploylar eski kayıtları yeniden kopyalamaz. Hem eski hem yeni eş tablolar doluysa ilk aktarım otomatik birleştirme yapmadan hata verir ve transaction geri alınır.
+
+Yeni kurulumda `REQUIRE_EXISTING_DB=0`, en az 12 karakterli `ADMIN_INITIAL_PASSWORD` ve `SECRET_KEY` gerekir. Mevcut üretim veritabanında bu kurulum seçeneğini kullanmayın.
+
+Deploy sonrasında loglarda `SQLite backup created` ve `CRM schema ready` mesajlarını, mevcut kullanıcıyla girişi, müşteri/teklif/görev sayılarını ve yüklenen dosyaları kontrol edin. Kullanıcının sağladığı mevcut veritabanının ayrı kopyasında 2657 müşteri, 6 kullanıcı ve 1 görev aktarımı, ikinci geçişte kayıt sayılarının korunması, SQLite bütünlüğü ve API yanıtı doğrulanmıştır. Kaynak dosyanın SHA-256 özeti test öncesi ve sonrasında aynıdır. Veritabanı dosyaları Git deposuna eklenmez.
